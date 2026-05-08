@@ -29,6 +29,9 @@ const SESSION_ID =
   `node-repl-mcp-${os.hostname()}-${realProcess.pid}-${randomUUID()}`;
 const TURN_ID = realProcess.env.CODEX_NODE_REPL_TURN_ID || `${SESSION_ID}-turn`;
 const JS_TIMEOUT_MS = parseNonNegativeInt(realProcess.env.CODEX_NODE_REPL_JS_TIMEOUT_MS, 120000);
+const EXIT_ON_TIMEOUT = /^(1|true|yes)$/i.test(
+  realProcess.env.CODEX_NODE_REPL_EXIT_ON_TIMEOUT || ""
+);
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
@@ -359,7 +362,7 @@ function shouldReplayLastImagesAfterCleanup(code, result) {
 class JsTimeoutError extends Error {
   constructor(timeoutMs) {
     super(
-      `js tool timed out after ${timeoutMs}ms; restarting node_repl MCP process to clear pending browser state`
+      `js tool timed out after ${timeoutMs}ms; node_repl MCP transport remains open for follow-up calls`
     );
     this.name = "JsTimeoutError";
   }
@@ -485,7 +488,7 @@ async function handleMessage(message) {
     }
   } catch (error) {
     log("request failed", `${message.method || "unknown"} ${error.stack || error.message}`);
-    if (error?.name === "JsTimeoutError") scheduleTimeoutExit();
+    if (error?.name === "JsTimeoutError" && EXIT_ON_TIMEOUT) scheduleTimeoutExit();
     try {
       sendError(message.id, error);
     } catch (writeError) {

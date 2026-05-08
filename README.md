@@ -186,7 +186,10 @@ If `mcp__node_repl__js` appears to hang, check for old
 JavaScript tool has a default 120 second timeout; override it with
 `CODEX_NODE_REPL_JS_TIMEOUT_MS=0` to disable the timeout or another millisecond
 value to tune it. The `js` tool also accepts per-call `timeout_ms`/`timeoutMs`
-values, matching the official runtime's call shape.
+values, matching the official runtime's call shape. A timeout returns an MCP
+error but keeps the stdio transport open, so follow-up calls such as `js_reset`
+can still recover the session. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if
+you explicitly want timeout errors to terminate the MCP process.
 
 If a screenshot task says it succeeded but no image appears in the final
 assistant message, check whether the final message references

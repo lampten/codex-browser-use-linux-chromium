@@ -57,8 +57,9 @@ look detached to the next call.
 
 The `js` tool also has a process-level timeout controlled by
 `CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 120000 ms. When a JavaScript
-call times out, the MCP server returns an error and exits shortly afterward so
-the app-server can start a clean process instead of keeping a blocked queue.
+call times out, the MCP server returns an error but keeps its stdio transport
+open so the same Codex turn can still run recovery calls such as `js_reset`.
+Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` to restore exit-on-timeout behavior.
 
 ## Install Safety
 
