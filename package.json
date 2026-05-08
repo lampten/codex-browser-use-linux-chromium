@@ -1,0 +1,24 @@
+{
+  "name": "codex-browser-use-linux-chromium",
+  "version": "0.1.0",
+  "description": "Unofficial compatibility layer for Codex Browser Use with Linux Chromium remote hosts.",
+  "type": "commonjs",
+  "bin": {
+    "codex-browser-use-linux-chromium": "bin/codex-browser-use-linux-chromium.js"
+  },
+  "scripts": {
+    "check": "node --check bin/codex-browser-use-linux-chromium.js && node --check src/native-host/codex-native-host-bridge.js && node --check src/node-repl/codex-node-repl-mcp.js",
+    "doctor": "node bin/codex-browser-use-linux-chromium.js doctor"
+  },
+  "keywords": [
+    "codex",
+    "browser-use",
+    "chromium",
+    "linux",
+    "mcp"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

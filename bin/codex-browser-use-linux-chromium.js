@@ -1,0 +1,884 @@
+#!/usr/bin/env node
+"use strict";
+
+const childProcess = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const PROJECT_ROOT = path.resolve(__dirname, "..");
+const APP_NAME = "codex-browser-use-linux-chromium";
+const DEFAULT_EXTENSION_ID = "hehggadaopoacecdllhhajmbjkdcmajg";
+const DEFAULT_NATIVE_HOST_NAME = "com.openai.codexextension";
+const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
+const BACKUP_SUFFIX = ".codex-browser-use-linux-chromium.bak.";
+const DESKTOP_SHIM_DIRS = [
+  "/Applications/Codex.app/Contents/Resources",
+  "/Applications/Codex (Beta).app/Contents/Resources",
+];
+
+function usage() {
+  console.log(`Usage:
+  node bin/codex-browser-use-linux-chromium.js install [options]
+  node bin/codex-browser-use-linux-chromium.js doctor [options]
+  node bin/codex-browser-use-linux-chromium.js patch-plugin [options]
+  node bin/codex-browser-use-linux-chromium.js restore-plugin [options]
+
+Options:
+  --codex-home PATH          Codex home directory. Default: ~/.codex
+  --install-root PATH        Runtime install root. Default: ~/.local/share/${APP_NAME}
+  --browser-config-root PATH Browser config root. Default: ~/.config
+  --plugin-root PATH         Patch this plugin root. Can be repeated.
+  --extension-id ID          Chrome extension ID. Default: ${DEFAULT_EXTENSION_ID}
+  --native-host-name NAME    Native host name. Default: ${DEFAULT_NATIVE_HOST_NAME}
+  --system-native-host       Also install system Chromium/Chrome native host manifests.
+  --desktop-shims            Install macOS Codex Desktop remote path shims.
+  --write-codex-config       Add or update a known node_repl MCP block in config.toml.
+  --allow-non-linux          Allow writes on non-Linux hosts. Intended for tests.
+  --dry-run                  Print actions without writing.
+  --json                     JSON output for doctor.
+  --help                     Show this help.
+`);
+}
+
+function parseArgs(argv) {
+  const args = {
+    command: argv[0] || "doctor",
+    pluginRoots: [],
+    desktopShims: false,
+    systemNativeHost: false,
+    writeCodexConfig: false,
+    dryRun: false,
+    json: false,
+  };
+
+  for (let i = 1; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => {
+      i += 1;
+      if (i >= argv.length) throw new Error(`Missing value for ${arg}`);
+      return argv[i];
+    };
+
+    if (arg === "--help" || arg === "-h") args.help = true;
+    else if (arg === "--codex-home") args.codexHome = next();
+    else if (arg === "--install-root") args.installRoot = next();
+    else if (arg === "--browser-config-root") args.browserConfigRoot = next();
+    else if (arg === "--plugin-root") args.pluginRoots.push(next());
+    else if (arg === "--extension-id") args.extensionId = next();
+    else if (arg === "--native-host-name") args.nativeHostName = next();
+    else if (arg === "--system-native-host") args.systemNativeHost = true;
+    else if (arg === "--desktop-shims") args.desktopShims = true;
+    else if (arg === "--write-codex-config") args.writeCodexConfig = true;
+    else if (arg === "--allow-non-linux") args.allowNonLinux = true;
+    else if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--json") args.json = true;
+    else throw new Error(`Unknown option: ${arg}`);
+  }
+
+  const home = os.homedir();
+  args.codexHome = path.resolve(expandHome(args.codexHome || path.join(home, ".codex")));
+  args.installRoot = path.resolve(
+    expandHome(args.installRoot || path.join(home, ".local", "share", APP_NAME))
+  );
+  args.browserConfigRoot = path.resolve(expandHome(args.browserConfigRoot || path.join(home, ".config")));
+  args.extensionId = args.extensionId || DEFAULT_EXTENSION_ID;
+  args.nativeHostName = args.nativeHostName || DEFAULT_NATIVE_HOST_NAME;
+  args.pluginRoots = args.pluginRoots.map((root) => path.resolve(expandHome(root)));
+  return args;
+}
+
+function expandHome(value) {
+  if (!value) return value;
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+function logAction(args, message) {
+  if (!args.json) console.log(message);
+}
+
+function mkdirp(dir, args) {
+  if (args.dryRun) {
+    logAction(args, `mkdir -p ${dir}`);
+    return;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeFile(filePath, contents, mode, args) {
+  if (args.dryRun) {
+    logAction(args, `write ${filePath}`);
+    return;
+  }
+  mkdirp(path.dirname(filePath), args);
+  fs.writeFileSync(filePath, contents);
+  if (mode != null) fs.chmodSync(filePath, mode);
+}
+
+function copyFile(src, dest, mode, args) {
+  if (args.dryRun) {
+    logAction(args, `copy ${src} -> ${dest}`);
+    return;
+  }
+  mkdirp(path.dirname(dest), args);
+  fs.copyFileSync(src, dest);
+  if (mode != null) fs.chmodSync(dest, mode);
+}
+
+function commandPath(command) {
+  const probe = process.platform === "win32" ? "where" : "which";
+  try {
+    return childProcess
+      .execFileSync(probe, [command], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .split(/\r?\n/)
+      .find(Boolean) || null;
+  } catch {
+    return null;
+  }
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
+  }
+}
+
+function browserUseSocketStatus(socketDir = DEFAULT_SOCKET_DIR) {
+  if (!fs.existsSync(socketDir)) return [];
+  return fs
+    .readdirSync(socketDir)
+    .filter((entry) => /^chromium-\d+\.sock$/.test(entry))
+    .sort()
+    .map((entry) => {
+      const socketPath = path.join(socketDir, entry);
+      const pid = Number(entry.match(/^chromium-(\d+)\.sock$/)[1]);
+      let isSocket = false;
+      try {
+        isSocket = fs.statSync(socketPath).isSocket();
+      } catch {
+        // Treat races as non-socket entries; doctor is advisory.
+      }
+      const ownerProcessAlive = processExists(pid);
+      return {
+        path: socketPath,
+        pid,
+        isSocket,
+        ownerProcessAlive,
+        stale: isSocket && !ownerProcessAlive,
+      };
+    });
+}
+
+function runtimePaths(args) {
+  return {
+    nativeHostBridge: path.join(args.installRoot, "native-host", "codex-native-host-bridge.js"),
+    nodeReplMcp: path.join(args.installRoot, "node-repl", "codex-node-repl-mcp.js"),
+  };
+}
+
+function resolveCodexPath() {
+  return (
+    process.env.CODEX_CLI_PATH ||
+    commandPath("codex") ||
+    existingPath(path.join(os.homedir(), ".npm-global", "bin", "codex")) ||
+    existingPath(path.join(os.homedir(), ".local", "bin", "codex")) ||
+    null
+  );
+}
+
+function installRuntime(args) {
+  const paths = runtimePaths(args);
+  copyFile(
+    path.join(PROJECT_ROOT, "src", "native-host", "codex-native-host-bridge.js"),
+    paths.nativeHostBridge,
+    0o755,
+    args
+  );
+  copyFile(
+    path.join(PROJECT_ROOT, "src", "node-repl", "codex-node-repl-mcp.js"),
+    paths.nodeReplMcp,
+    0o755,
+    args
+  );
+  return paths;
+}
+
+function userNativeManifestPaths(args) {
+  return [
+    path.join(args.browserConfigRoot, "chromium", "NativeMessagingHosts", `${args.nativeHostName}.json`),
+    path.join(
+      args.browserConfigRoot,
+      "google-chrome",
+      "NativeMessagingHosts",
+      `${args.nativeHostName}.json`
+    ),
+  ];
+}
+
+function systemNativeManifestPaths(args) {
+  return [
+    path.join("/etc", "chromium", "native-messaging-hosts", `${args.nativeHostName}.json`),
+    path.join("/etc", "opt", "chrome", "native-messaging-hosts", `${args.nativeHostName}.json`),
+  ];
+}
+
+function installNativeHostManifests(args, paths) {
+  const manifest = {
+    name: args.nativeHostName,
+    description: "Codex Browser Use Linux Chromium native host bridge",
+    path: paths.nativeHostBridge,
+    type: "stdio",
+    allowed_origins: [`chrome-extension://${args.extensionId}/`],
+  };
+  const manifestContents = `${JSON.stringify(manifest, null, 2)}\n`;
+
+  for (const manifestPath of userNativeManifestPaths(args)) {
+    writeFile(manifestPath, manifestContents, 0o644, args);
+  }
+  if (args.systemNativeHost) {
+    for (const manifestPath of systemNativeManifestPaths(args)) {
+      writePrivilegedFile(manifestPath, manifestContents, "0644", args);
+    }
+  }
+}
+
+function detectPluginRoots(args) {
+  const roots = new Set();
+  for (const root of args.pluginRoots) {
+    assertPluginRoot(root, "explicit");
+    roots.add(root);
+  }
+
+  const cacheRoot = path.join(args.codexHome, "plugins", "cache");
+  for (const marketplace of ["openai-bundled", "openai-bundled-beta"]) {
+    const chromeRoot = path.join(cacheRoot, marketplace, "chrome");
+    if (!fs.existsSync(chromeRoot)) continue;
+
+    for (const entry of fs.readdirSync(chromeRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const candidate = path.join(chromeRoot, entry.name);
+      if (fs.existsSync(path.join(candidate, "scripts", "browser-client.mjs"))) roots.add(candidate);
+    }
+  }
+  return [...roots].sort();
+}
+
+function assertPluginRoot(root, kind = "plugin") {
+  const browserClient = path.join(root, "scripts", "browser-client.mjs");
+  if (!fs.existsSync(browserClient)) {
+    throw new Error(`${kind} plugin root is not a Chrome plugin root: ${root}`);
+  }
+}
+
+function backupFile(filePath, args) {
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  const backupPath = `${filePath}${BACKUP_SUFFIX}${stamp}`;
+  if (args.dryRun) {
+    logAction(args, `backup ${filePath} -> ${backupPath}`);
+    return backupPath;
+  }
+  fs.copyFileSync(filePath, backupPath);
+  return backupPath;
+}
+
+function planTextPatch(filePath, patcher) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Required plugin file is missing: ${filePath}`);
+  }
+  const before = fs.readFileSync(filePath, "utf8");
+  const after = patcher(before);
+  return { filePath, before, after, changed: after !== before };
+}
+
+function replaceRequired(text, from, to, label) {
+  if (text.includes(to)) return text;
+  if (!text.includes(from)) {
+    throw new Error(`Could not find patch point for ${label}`);
+  }
+  return text.replace(from, to);
+}
+
+function patchBrowserClient(text) {
+  if (text.includes("globalThis.__codexNativePipe")) return text;
+  if (!text.includes("import.meta.__codexNativePipe")) {
+    throw new Error("Could not find import.meta.__codexNativePipe");
+  }
+  return text.replace(
+    /import\.meta\.__codexNativePipe/g,
+    "(import.meta.__codexNativePipe??globalThis.__codexNativePipe)"
+  );
+}
+
+function patchInstalledBrowsers(text) {
+  if (text.includes('name: "Chromium"')) return text;
+  const match = text.match(/(\{\s*name:\s*"Google Chrome"[\s\S]*?windowsExecutable:\s*"chrome\.exe",\s*\},)/);
+  if (!match) throw new Error("Could not find Google Chrome browser entry");
+  return text.replace(
+    match[1],
+    `${match[1]}
+  {
+    name: "Chromium",
+    bundleIds: ["org.chromium.Chromium"],
+    appNames: ["Chromium.app"],
+    commands: ["chromium", "chromium-browser"],
+    windowsExecutable: null,
+  },`
+  );
+}
+
+function patchChromeIsRunning(text) {
+  if (text.includes('"chromium"')) return text;
+  if (text.includes('linux: new Set(["chrome", "google-chrome"]),')) {
+    return text.replace(
+      'linux: new Set(["chrome", "google-chrome"]),',
+      'linux: new Set(["chrome", "google-chrome", "chromium", "chromium-browser"]),'
+    );
+  }
+  return replaceRequired(
+    text,
+    '  win32: new Set(["chrome.exe"]),',
+    '  win32: new Set(["chrome.exe"]),\n  linux: new Set(["chrome", "google-chrome", "chromium", "chromium-browser"]),',
+    "Linux Chrome process names"
+  );
+}
+
+function patchLinuxUserDataDirectory(text) {
+  if (text.includes('".config", "chromium"')) return text;
+  return replaceRequired(
+    text,
+    'return path.join(os.homedir(), ".config", "google-chrome");',
+    `const chromiumDirectory = path.join(os.homedir(), ".config", "chromium");
+  if (fs.existsSync(chromiumDirectory)) return chromiumDirectory;
+
+  return path.join(os.homedir(), ".config", "google-chrome");`,
+    "Linux Chromium user data directory"
+  );
+}
+
+function patchCheckNativeHostManifest(text) {
+  let output = text;
+  if (!output.includes("resolveLinuxNativeHostManifestPath")) {
+    const unsupportedPlatformBlock =
+      /  throw new Error\(\r?\n    `Unsupported platform for native host manifest check: \$\{process\.platform\}\. This script supports macOS and Windows\.`,\r?\n  \);\r?\n}/;
+    if (!unsupportedPlatformBlock.test(output)) {
+      throw new Error("Could not find patch point for Linux native host manifest path");
+    }
+    output = output.replace(
+      unsupportedPlatformBlock,
+      `  if (process.platform === "linux") {
+    return {
+      manifestPath: resolveLinuxNativeHostManifestPath(),
+      registryKey: null,
+      registryManifestPath: null,
+      registryKeyExists: null,
+    };
+  }
+
+  throw new Error(
+    \`Unsupported platform for native host manifest check: \${process.platform}. This script supports macOS, Linux, and Windows.\`,
+  );
+}
+
+function resolveLinuxNativeHostManifestPath() {
+  const candidates = [
+    path.join(os.homedir(), ".config", "chromium", "NativeMessagingHosts", \`\${expectedHostName}.json\`),
+    path.join("/etc", "chromium", "native-messaging-hosts", \`\${expectedHostName}.json\`),
+    path.join(os.homedir(), ".config", "google-chrome", "NativeMessagingHosts", \`\${expectedHostName}.json\`),
+    path.join("/etc", "opt", "chrome", "native-messaging-hosts", \`\${expectedHostName}.json\`),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}`,
+    );
+  }
+  return output;
+}
+
+function patchOpenChromeWindow(text) {
+  let output = patchLinuxUserDataDirectory(text);
+  if (output.includes('commandPath("chromium")')) return output;
+  const linuxLaunchBlock = /  return \{\r?\n    command: "google-chrome",\r?\n    args: chromeArgs,\r?\n  \};/;
+  if (!linuxLaunchBlock.test(output)) {
+    throw new Error("Could not find patch point for Linux Chromium launch command");
+  }
+  return output.replace(
+    linuxLaunchBlock,
+    `  const linuxChromeCommand =
+    commandPath("chromium") ||
+    commandPath("chromium-browser") ||
+    commandPath("google-chrome") ||
+    "google-chrome";
+  return {
+    command: linuxChromeCommand,
+    args: chromeArgs,
+  };`
+  );
+}
+
+const SCREENSHOT_OUTPUT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: screenshot-output-compatibility";
+
+function patchChromeSkill(text) {
+  if (
+    text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
+    text.includes("final answer must include the Markdown image link")
+  ) {
+    return text;
+  }
+  let output = text.replace(
+    new RegExp(
+      `\\r?\\n## Screenshot Output Compatibility\\r?\\n\\r?\\n<!-- ${escapeRegExp(
+        SCREENSHOT_OUTPUT_PATCH_MARKER
+      )} -->[\\s\\S]*?(?=\\r?\\n## Tab Cleanup)`
+    ),
+    ""
+  );
+  const tabCleanupHeader = /\r?\n## Tab Cleanup/;
+  if (!tabCleanupHeader.test(output)) {
+    throw new Error("Could not find patch point for Chrome skill screenshot output instructions");
+  }
+  const section = `
+## Screenshot Output Compatibility
+
+<!-- ${SCREENSHOT_OUTPUT_PATCH_MARKER} -->
+
+- When a screenshot is the requested deliverable, save it to an absolute file path under \`nodeRepl.cwd\`, emit it, and make the final answer include the Markdown image link for that saved path.
+- Preferred pattern:
+
+\`\`\`js
+const image = await tab.playwright.screenshot({ fullPage: false });
+const imagePath = await nodeRepl.emitImage(image, { fileName: "google-screenshot.png" });
+await browser.tabs.finalize({ keep: [{ tab, status: "deliverable" }] });
+nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
+\`\`\`
+
+- The final answer must include the Markdown image link, for example \`![Google screenshot](/absolute/path/google-screenshot.png)\`. Do not only say that the screenshot is "shown above".
+- Do not reference \`attachment://...\` image URLs in the final response. Prior tool-output images are not exposed under those attachment URIs in this compatibility runtime.
+
+`;
+  return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);
+}
+
+const PLUGIN_PATCHES = [
+  ["scripts/browser-client.mjs", patchBrowserClient],
+  ["scripts/installed-browsers.js", patchInstalledBrowsers],
+  ["scripts/chrome-is-running.js", patchChromeIsRunning],
+  ["scripts/check-extension-installed.js", patchLinuxUserDataDirectory],
+  ["scripts/check-native-host-manifest.js", patchCheckNativeHostManifest],
+  ["scripts/open-chrome-window.js", patchOpenChromeWindow],
+  ["skills/chrome/SKILL.md", patchChromeSkill],
+];
+
+function planPluginRootPatch(root) {
+  assertPluginRoot(root);
+  const results = [];
+  for (const [relativePath, patcher] of PLUGIN_PATCHES) {
+    const filePath = path.join(root, relativePath);
+    results.push(planTextPatch(filePath, patcher));
+  }
+  return { root, results };
+}
+
+function planPluginPatches(args) {
+  const roots = detectPluginRoots(args);
+  if (roots.length === 0) {
+    return [];
+  }
+  return roots.map(planPluginRootPatch);
+}
+
+function commitPluginPatchPlans(plans, args) {
+  if (plans.length === 0) {
+    logAction(args, "No Chrome plugin roots found.");
+    return [];
+  }
+
+  for (const plan of plans) {
+    for (const file of plan.results) {
+      if (!file.changed) continue;
+      backupFile(file.filePath, args);
+      writeFile(file.filePath, file.after, null, args);
+    }
+  }
+
+  for (const plan of plans) {
+    logAction(args, `patched plugin root: ${plan.root}`);
+    for (const file of plan.results) {
+      logAction(args, `  ${file.changed ? "changed" : "ok"} ${path.relative(plan.root, file.filePath)}`);
+    }
+  }
+  return plans;
+}
+
+function patchPlugins(args) {
+  return commitPluginPatchPlans(planPluginPatches(args), args);
+}
+
+function sudoExec(argsList) {
+  childProcess.execFileSync("sudo", ["-n", ...argsList], { stdio: "inherit" });
+}
+
+function writePrivilegedShim(targetFile, contents, args) {
+  writePrivilegedFile(targetFile, contents, "0755", args);
+}
+
+function writePrivilegedFile(targetFile, contents, mode, args) {
+  if (args.dryRun) {
+    logAction(args, `sudo install -m ${mode} ${targetFile}`);
+    return;
+  }
+  const tempFile = path.join(os.tmpdir(), `${APP_NAME}-${process.pid}-${path.basename(targetFile)}`);
+  fs.writeFileSync(tempFile, contents, { mode: Number.parseInt(mode, 8) });
+  try {
+    sudoExec(["mkdir", "-p", path.dirname(targetFile)]);
+    sudoExec(["install", "-m", mode, tempFile, targetFile]);
+  } finally {
+    fs.rmSync(tempFile, { force: true });
+  }
+}
+
+function installDesktopShims(args, paths) {
+  const nodePath = commandPath("node") || process.execPath;
+  const codexPath = resolveCodexPath() || "";
+  const codexExport = codexPath ? `export CODEX_CLI_PATH="${codexPath}"\n` : "unset CODEX_CLI_PATH\n";
+  const shim = `#!/bin/sh
+set -eu
+export CODEX_HOME="${args.codexHome}"
+${codexExport}export NODE_REPL_NODE_PATH="${nodePath}"
+exec "${nodePath}" "${paths.nodeReplMcp}" "$@"
+`;
+  for (const dir of DESKTOP_SHIM_DIRS) {
+    writePrivilegedShim(path.join(dir, "node_repl"), shim, args);
+    if (!args.dryRun) {
+      sudoExec(["ln", "-sfn", nodePath, path.join(dir, "node")]);
+      if (codexPath) sudoExec(["ln", "-sfn", codexPath, path.join(dir, "codex")]);
+    } else {
+      logAction(args, `sudo ln -sfn ${nodePath} ${path.join(dir, "node")}`);
+      if (codexPath) logAction(args, `sudo ln -sfn ${codexPath} ${path.join(dir, "codex")}`);
+    }
+  }
+}
+
+function existingPath(filePath) {
+  return fs.existsSync(filePath) ? filePath : null;
+}
+
+function writeCodexConfig(args, paths) {
+  const configPath = path.join(args.codexHome, "config.toml");
+  const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const table = nodeReplConfigTable(args, paths);
+  const existingBlock = findTomlTable(existing, "mcp_servers.node_repl");
+
+  if (existingBlock) {
+    const status = nodeReplConfigBlockStatus(existingBlock.block, paths);
+    if (status.pathMatches) {
+      logAction(args, "config.toml node_repl MCP block already points at this runtime");
+      return false;
+    }
+    if (!status.knownCodexNodeRepl) {
+      logAction(args, "config.toml contains a custom [mcp_servers.node_repl] block; leaving it unchanged");
+      return false;
+    }
+    if (args.dryRun) {
+      logAction(args, `update node_repl MCP block in ${configPath}`);
+      return true;
+    }
+    const updated =
+      existing.slice(0, existingBlock.start) + table + existing.slice(existingBlock.end);
+    mkdirp(path.dirname(configPath), args);
+    fs.writeFileSync(configPath, updated);
+    return true;
+  }
+
+  if (args.dryRun) {
+    logAction(args, `append node_repl MCP block to ${configPath}`);
+    return true;
+  }
+  mkdirp(path.dirname(configPath), args);
+  const prefix = existing.length === 0 ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
+  fs.appendFileSync(configPath, `${prefix}${table}`);
+  return true;
+}
+
+function nodeReplConfigTable(args, paths) {
+  const nodePath = commandPath("node") || process.execPath;
+  return `# Added by ${APP_NAME}
+[mcp_servers.node_repl]
+command = "${escapeTomlString(nodePath)}"
+args = ["${escapeTomlString(paths.nodeReplMcp)}"]
+`;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findTomlTable(text, dottedName) {
+  const tableStart = new RegExp(`(^|\\r?\\n)\\[${escapeRegExp(dottedName)}\\]\\r?\\n`);
+  const match = tableStart.exec(text);
+  if (!match) return null;
+  const start = match.index + (match[1] ? match[1].length : 0);
+  const headerEnd = match.index + match[0].length;
+  const rest = text.slice(headerEnd);
+  const nextMatch = /\r?\n\[[^\]]+\]/.exec(rest);
+  const end = nextMatch ? headerEnd + nextMatch.index : text.length;
+  return { start, end, block: text.slice(start, end) };
+}
+
+function nodeReplConfigBlockStatus(block, paths) {
+  return {
+    exists: Boolean(block),
+    pathMatches:
+      typeof block === "string" &&
+      block.includes(paths.nodeReplMcp.replace(/\\/g, "\\\\")),
+    knownCodexNodeRepl:
+      typeof block === "string" &&
+      /codex-(browser-use-linux-chromium|chrome-extension)[\s\S]*codex-node-repl-mcp\.js/.test(
+        block
+      ),
+  };
+}
+
+function escapeTomlString(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function install(args) {
+  requireLinuxWrites(args);
+  preflightInstall(args);
+  const pluginPatchPlans = planPluginPatches(args);
+  const paths = installRuntime(args);
+  installNativeHostManifests(args, paths);
+  commitPluginPatchPlans(pluginPatchPlans, args);
+  if (args.writeCodexConfig) writeCodexConfig(args, paths);
+  if (args.desktopShims) installDesktopShims(args, paths);
+  logAction(args, "install complete");
+}
+
+function preflightInstall(args) {
+  if ((!args.desktopShims && !args.systemNativeHost) || args.dryRun) return;
+  if (!commandPath("sudo")) {
+    throw new Error("Requested privileged install paths require sudo, but sudo is not available");
+  }
+  try {
+    childProcess.execFileSync("sudo", ["-n", "true"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  } catch {
+    throw new Error("Requested privileged install paths require passwordless sudo. Run with sudo configured, or omit --desktop-shims/--system-native-host and create those files manually.");
+  }
+}
+
+function requireLinuxWrites(args) {
+  if (process.platform === "linux" || args.dryRun || args.allowNonLinux) return;
+  throw new Error("Refusing to write on a non-Linux host. Run on the Linux remote host, use --dry-run, or pass --allow-non-linux for tests.");
+}
+
+function patchStatusForRoot(root) {
+  const read = (relativePath) => {
+    const filePath = path.join(root, relativePath);
+    return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  };
+  const browserClient = read("scripts/browser-client.mjs");
+  const installedBrowsers = read("scripts/installed-browsers.js");
+  const chromeIsRunning = read("scripts/chrome-is-running.js");
+  const extensionInstalled = read("scripts/check-extension-installed.js");
+  const nativeHostManifest = read("scripts/check-native-host-manifest.js");
+  const openWindow = read("scripts/open-chrome-window.js");
+  const chromeSkill = read("skills/chrome/SKILL.md");
+  return {
+    root,
+    browserClientNativePipeFallback: /\?\?globalThis\.__codexNativePipe/.test(browserClient),
+    installedBrowsersChromium:
+      /name:\s*"Chromium"[\s\S]*commands:\s*\[[^\]]*"chromium"[^\]]*"chromium-browser"/.test(
+        installedBrowsers
+      ),
+    chromeIsRunningChromium:
+      /linux:\s*new Set\(\[[^\)]*"chromium"[^\)]*"chromium-browser"[^\)]*\]\)/.test(
+        chromeIsRunning
+      ),
+    extensionCheckChromiumProfile:
+      /path\.join\(os\.homedir\(\),\s*"\.config",\s*"chromium"\)/.test(extensionInstalled),
+    nativeHostManifestLinux:
+      /process\.platform\s*===\s*"linux"[\s\S]*resolveLinuxNativeHostManifestPath/.test(
+        nativeHostManifest
+      ),
+    openWindowChromium:
+      /commandPath\("chromium"\)[\s\S]*command:\s*linuxChromeCommand/.test(openWindow),
+    chromeSkillScreenshotOutput:
+      chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
+      chromeSkill.includes("final answer must include the Markdown image link"),
+  };
+}
+
+function nativeManifestStatus(manifestPath, expectedNativeHostPath) {
+  const status = {
+    path: manifestPath,
+    exists: fs.existsSync(manifestPath),
+    actualNativeHostPath: null,
+    pathMatches: false,
+  };
+  if (!status.exists) return status;
+
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    status.actualNativeHostPath = typeof manifest.path === "string" ? manifest.path : null;
+    status.pathMatches =
+      status.actualNativeHostPath != null &&
+      path.resolve(status.actualNativeHostPath) === path.resolve(expectedNativeHostPath);
+  } catch (error) {
+    status.error = error.message;
+  }
+  return status;
+}
+
+function doctor(args) {
+  const paths = runtimePaths(args);
+  const pluginRoots = detectPluginRoots(args);
+  const configPath = path.join(args.codexHome, "config.toml");
+  const configText = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const nodeReplConfig = findTomlTable(configText, "mcp_servers.node_repl");
+  const report = {
+    platform: process.platform,
+    arch: process.arch,
+    node: {
+      execPath: process.execPath,
+      version: process.version,
+    },
+    commands: {
+      chromium: commandPath("chromium"),
+      chromiumBrowser: commandPath("chromium-browser"),
+      googleChrome: commandPath("google-chrome"),
+      codex: resolveCodexPath(),
+    },
+    codexHome: args.codexHome,
+    installRoot: args.installRoot,
+    browserConfigRoot: args.browserConfigRoot,
+    codexConfig: {
+      path: configPath,
+      nodeReplMcp: nodeReplConfigBlockStatus(nodeReplConfig?.block || "", paths),
+    },
+    runtime: {
+      nativeHostBridge: { path: paths.nativeHostBridge, exists: fs.existsSync(paths.nativeHostBridge) },
+      nodeReplMcp: { path: paths.nodeReplMcp, exists: fs.existsSync(paths.nodeReplMcp) },
+    },
+    nativeHostManifests: userNativeManifestPaths(args).map((manifestPath) =>
+      nativeManifestStatus(manifestPath, paths.nativeHostBridge)
+    ),
+    systemNativeHostManifests: systemNativeManifestPaths(args).map((manifestPath) =>
+      nativeManifestStatus(manifestPath, paths.nativeHostBridge)
+    ),
+    browserUseSockets: browserUseSocketStatus(),
+    desktopShims: [
+      path.join(DESKTOP_SHIM_DIRS[0], "node_repl"),
+      path.join(DESKTOP_SHIM_DIRS[1], "node_repl"),
+    ].map((shimPath) => ({ path: shimPath, exists: fs.existsSync(shimPath) })),
+    pluginRoots: pluginRoots.map(patchStatusForRoot),
+  };
+
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  console.log(`${APP_NAME} doctor`);
+  console.log(`platform: ${report.platform} ${report.arch}`);
+  console.log(`node: ${report.node.version} ${report.node.execPath}`);
+  console.log(`chromium: ${report.commands.chromium || report.commands.chromiumBrowser || "not found"}`);
+  console.log(`codex: ${report.commands.codex || "not found"}`);
+  console.log(`install root: ${report.installRoot}`);
+  console.log(`browser config root: ${report.browserConfigRoot}`);
+  console.log(
+    `config node_repl: ${
+      report.codexConfig.nodeReplMcp.pathMatches
+        ? "ok"
+        : report.codexConfig.nodeReplMcp.exists
+          ? "mismatch"
+          : "missing"
+    } ${report.codexConfig.path}`
+  );
+  console.log(`native host bridge: ${report.runtime.nativeHostBridge.exists ? "ok" : "missing"}`);
+  console.log(`node_repl MCP: ${report.runtime.nodeReplMcp.exists ? "ok" : "missing"}`);
+  for (const manifest of report.nativeHostManifests) {
+    console.log(
+      `manifest: ${manifest.pathMatches ? "ok" : manifest.exists ? "mismatch" : "missing"} ${manifest.path}`
+    );
+  }
+  for (const manifest of report.systemNativeHostManifests) {
+    console.log(
+      `system manifest: ${manifest.pathMatches ? "ok" : manifest.exists ? "mismatch" : "missing"} ${manifest.path}`
+    );
+  }
+  for (const shim of report.desktopShims) {
+    console.log(`desktop shim: ${shim.exists ? "ok" : "missing"} ${shim.path}`);
+  }
+  for (const socket of report.browserUseSockets) {
+    console.log(
+      `socket: ${socket.stale ? "stale" : "ok"} ${socket.path} pid=${socket.pid} alive=${socket.ownerProcessAlive}`
+    );
+  }
+  for (const root of report.pluginRoots) {
+    const ok = Object.entries(root)
+      .filter(([key]) => key !== "root")
+      .every(([, value]) => value === true);
+    console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.root}`);
+  }
+}
+
+function restorePlugin(args) {
+  requireLinuxWrites(args);
+  const roots = detectPluginRoots(args);
+  for (const root of roots) {
+    restoreBackupsInDirectory(path.join(root, "scripts"), args);
+    restoreBackupsInDirectory(path.join(root, "skills", "chrome"), args);
+  }
+}
+
+function restoreBackupsInDirectory(dir, args) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir)) {
+    if (!entry.includes(BACKUP_SUFFIX)) continue;
+    const backupPath = path.join(dir, entry);
+    const targetPath = path.join(dir, entry.split(BACKUP_SUFFIX)[0]);
+    const allBackups = fs
+      .readdirSync(dir)
+      .filter((name) => name.startsWith(`${path.basename(targetPath)}${BACKUP_SUFFIX}`))
+      .sort();
+    if (entry !== allBackups.at(-1)) continue;
+    copyFile(backupPath, targetPath, null, args);
+    logAction(args, `restored ${targetPath} from ${backupPath}`);
+  }
+}
+
+function main() {
+  let args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+    if (args.help) {
+      usage();
+      return;
+    }
+    if (args.command === "install") install(args);
+    else if (args.command === "doctor") doctor(args);
+    else if (args.command === "patch-plugin") {
+      requireLinuxWrites(args);
+      patchPlugins(args);
+    }
+    else if (args.command === "restore-plugin") restorePlugin(args);
+    else {
+      usage();
+      throw new Error(`Unknown command: ${args.command}`);
+    }
+  } catch (error) {
+    if (args?.json) console.log(JSON.stringify({ error: error.message }, null, 2));
+    else console.error(`error: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+main();
