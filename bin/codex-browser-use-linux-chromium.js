@@ -316,14 +316,37 @@ function replaceRequired(text, from, to, label) {
 }
 
 function patchBrowserClient(text) {
-  if (text.includes("globalThis.__codexNativePipe")) return text;
-  if (!text.includes("import.meta.__codexNativePipe")) {
+  if (!text.includes("import.meta.__codexNativePipe") && !text.includes("globalThis.__codexNativePipe")) {
     throw new Error("Could not find import.meta.__codexNativePipe");
   }
-  return text.replace(
-    /import\.meta\.__codexNativePipe/g,
+
+  let output = text.replace(
+    /\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)UnavailableMessage/g,
+    "import.meta.__codexNativePipeUnavailableMessage"
+  );
+  output = output.replace(
+    /\(\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)\?\?globalThis\.__codexNativePipe\)/g,
     "(import.meta.__codexNativePipe??globalThis.__codexNativePipe)"
   );
+  output = output.replace(
+    /\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)\?\?globalThis\.__codexNativePipe/g,
+    "(import.meta.__codexNativePipe??globalThis.__codexNativePipe)"
+  );
+  output = output.replace(
+    /import\.meta\.__codexNativePipe(?![A-Za-z0-9_$]|\?\?globalThis\.__codexNativePipe)/g,
+    "(import.meta.__codexNativePipe??globalThis.__codexNativePipe)"
+  );
+  if (!/\?\?globalThis\.__codexNativePipe/.test(output)) {
+    throw new Error("Could not apply native pipe fallback patch");
+  }
+  if (
+    /\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)UnavailableMessage/.test(
+      output
+    )
+  ) {
+    throw new Error("Native pipe fallback patch produced malformed UnavailableMessage access");
+  }
+  return output;
 }
 
 function patchInstalledBrowsers(text) {
@@ -709,6 +732,10 @@ function patchStatusForRoot(root) {
     root,
     kind,
     browserClientNativePipeFallback: /\?\?globalThis\.__codexNativePipe/.test(browserClient),
+    browserClientNativePipeFallbackSyntax:
+      !/\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)UnavailableMessage/.test(
+        browserClient
+      ),
   };
   if (kind !== "chrome") return status;
 
