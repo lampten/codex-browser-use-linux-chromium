@@ -256,13 +256,15 @@ function detectPluginRoots(args) {
 
   const cacheRoot = path.join(args.codexHome, "plugins", "cache");
   for (const marketplace of ["openai-bundled", "openai-bundled-beta"]) {
-    const chromeRoot = path.join(cacheRoot, marketplace, "chrome");
-    if (!fs.existsSync(chromeRoot)) continue;
+    for (const pluginName of ["chrome", "browser-use"]) {
+      const pluginRoot = path.join(cacheRoot, marketplace, pluginName);
+      if (!fs.existsSync(pluginRoot)) continue;
 
-    for (const entry of fs.readdirSync(chromeRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const candidate = path.join(chromeRoot, entry.name);
-      if (fs.existsSync(path.join(candidate, "scripts", "browser-client.mjs"))) roots.add(candidate);
+      for (const entry of fs.readdirSync(pluginRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const candidate = path.join(pluginRoot, entry.name);
+        if (fs.existsSync(path.join(candidate, "scripts", "browser-client.mjs"))) roots.add(candidate);
+      }
     }
   }
   return [...roots].sort();
@@ -271,8 +273,18 @@ function detectPluginRoots(args) {
 function assertPluginRoot(root, kind = "plugin") {
   const browserClient = path.join(root, "scripts", "browser-client.mjs");
   if (!fs.existsSync(browserClient)) {
-    throw new Error(`${kind} plugin root is not a Chrome plugin root: ${root}`);
+    throw new Error(`${kind} plugin root is not a Browser Use/Chrome plugin root: ${root}`);
   }
+}
+
+function pluginRootKind(root) {
+  if (
+    fs.existsSync(path.join(root, "skills", "chrome", "SKILL.md")) ||
+    fs.existsSync(path.join(root, "scripts", "installed-browsers.js"))
+  ) {
+    return "chrome";
+  }
+  return "browser-use";
 }
 
 function backupFile(filePath, args) {
@@ -464,7 +476,9 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);
 }
 
-const PLUGIN_PATCHES = [
+const BROWSER_USE_PLUGIN_PATCHES = [["scripts/browser-client.mjs", patchBrowserClient]];
+
+const CHROME_PLUGIN_PATCHES = [
   ["scripts/browser-client.mjs", patchBrowserClient],
   ["scripts/installed-browsers.js", patchInstalledBrowsers],
   ["scripts/chrome-is-running.js", patchChromeIsRunning],
@@ -474,14 +488,19 @@ const PLUGIN_PATCHES = [
   ["skills/chrome/SKILL.md", patchChromeSkill],
 ];
 
+function patchSetForRoot(root) {
+  return pluginRootKind(root) === "chrome" ? CHROME_PLUGIN_PATCHES : BROWSER_USE_PLUGIN_PATCHES;
+}
+
 function planPluginRootPatch(root) {
   assertPluginRoot(root);
+  const kind = pluginRootKind(root);
   const results = [];
-  for (const [relativePath, patcher] of PLUGIN_PATCHES) {
+  for (const [relativePath, patcher] of patchSetForRoot(root)) {
     const filePath = path.join(root, relativePath);
     results.push(planTextPatch(filePath, patcher));
   }
-  return { root, results };
+  return { root, kind, results };
 }
 
 function planPluginPatches(args) {
@@ -494,7 +513,7 @@ function planPluginPatches(args) {
 
 function commitPluginPatchPlans(plans, args) {
   if (plans.length === 0) {
-    logAction(args, "No Chrome plugin roots found.");
+    logAction(args, "No Browser Use/Chrome plugin roots found.");
     return [];
   }
 
@@ -507,7 +526,7 @@ function commitPluginPatchPlans(plans, args) {
   }
 
   for (const plan of plans) {
-    logAction(args, `patched plugin root: ${plan.root}`);
+    logAction(args, `patched ${plan.kind} plugin root: ${plan.root}`);
     for (const file of plan.results) {
       logAction(args, `  ${file.changed ? "changed" : "ok"} ${path.relative(plan.root, file.filePath)}`);
     }
@@ -684,7 +703,15 @@ function patchStatusForRoot(root) {
     const filePath = path.join(root, relativePath);
     return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
   };
+  const kind = pluginRootKind(root);
   const browserClient = read("scripts/browser-client.mjs");
+  const status = {
+    root,
+    kind,
+    browserClientNativePipeFallback: /\?\?globalThis\.__codexNativePipe/.test(browserClient),
+  };
+  if (kind !== "chrome") return status;
+
   const installedBrowsers = read("scripts/installed-browsers.js");
   const chromeIsRunning = read("scripts/chrome-is-running.js");
   const extensionInstalled = read("scripts/check-extension-installed.js");
@@ -692,8 +719,7 @@ function patchStatusForRoot(root) {
   const openWindow = read("scripts/open-chrome-window.js");
   const chromeSkill = read("skills/chrome/SKILL.md");
   return {
-    root,
-    browserClientNativePipeFallback: /\?\?globalThis\.__codexNativePipe/.test(browserClient),
+    ...status,
     installedBrowsersChromium:
       /name:\s*"Chromium"[\s\S]*commands:\s*\[[^\]]*"chromium"[^\]]*"chromium-browser"/.test(
         installedBrowsers
@@ -824,9 +850,9 @@ function doctor(args) {
   }
   for (const root of report.pluginRoots) {
     const ok = Object.entries(root)
-      .filter(([key]) => key !== "root")
+      .filter(([key]) => !["root", "kind"].includes(key))
       .every(([, value]) => value === true);
-    console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.root}`);
+    console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.kind} ${root.root}`);
   }
 }
 

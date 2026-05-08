@@ -27,8 +27,8 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
 - Gives each MCP process a unique Browser Use `session_id` and stable
   process-scoped `turn_id`, matching the isolation the official desktop runtime
   normally provides for browser-session state.
-- Patches locally cached Codex Chrome plugin scripts so they recognize
-  Chromium on Linux.
+- Patches locally cached Codex Browser Use / Chrome plugin scripts so they
+  recognize Chromium on Linux.
 - Optionally installs macOS Desktop remote path shims under `/Applications/...`
   on the Linux host. This is needed when Codex Desktop on macOS remotely
   connects to the Linux host and sends its own `node_repl` path through
@@ -91,9 +91,9 @@ node bin/codex-browser-use-linux-chromium.js doctor
   Use `--system-native-host` when Chromium already has a system manifest under
   `/etc/chromium/native-messaging-hosts` or Chrome has one under
   `/etc/opt/chrome/native-messaging-hosts`.
-- Patches discovered official Chrome plugin caches. Plugin patching is planned
-  transactionally per plugin root: if any required patch point is missing, that
-  plugin root is left untouched.
+- Patches discovered official Browser Use / Chrome plugin caches. Plugin
+  patching is planned transactionally per plugin root: if any required patch
+  point is missing, that plugin root is left untouched.
 - With `--desktop-shims`, creates Linux shims for macOS Codex Desktop remote
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`

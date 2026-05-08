@@ -373,7 +373,7 @@ async function withTimeoutMs(promise, timeoutMs) {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new JsTimeoutError(JS_TIMEOUT_MS)), JS_TIMEOUT_MS);
+        timer = setTimeout(() => reject(new JsTimeoutError(timeoutMs)), timeoutMs);
         timer.unref?.();
       }),
     ]);
@@ -391,7 +391,15 @@ function scheduleTimeoutExit() {
   if (timeoutExitRequested) return;
   timeoutExitRequested = true;
   endRequested = true;
-  setTimeout(() => realProcess.exit(124), 50);
+  log("timeout exit scheduled", `pid=${realProcess.pid}`);
+  setTimeout(() => {
+    log("timeout exit now", `pid=${realProcess.pid}`);
+    realProcess.exit(124);
+  }, 100);
+}
+
+function exitCodeForEnd() {
+  return timeoutExitRequested ? 124 : 0;
 }
 
 const tools = [
@@ -477,8 +485,12 @@ async function handleMessage(message) {
     }
   } catch (error) {
     log("request failed", `${message.method || "unknown"} ${error.stack || error.message}`);
-    sendError(message.id, error);
     if (error?.name === "JsTimeoutError") scheduleTimeoutExit();
+    try {
+      sendError(message.id, error);
+    } catch (writeError) {
+      log("failed to send error", writeError.stack || writeError.message);
+    }
   }
 }
 
@@ -498,7 +510,7 @@ STDIN.on("data", (chunk) => {
         .then(() => handleMessage(message))
         .catch((error) => log("queued request failed", error.stack || error.message))
         .finally(() => {
-          if (endRequested) realProcess.exit(0);
+          if (endRequested) realProcess.exit(exitCodeForEnd());
         });
     } catch (error) {
       log("parse failed", error.stack || error.message);
@@ -508,7 +520,7 @@ STDIN.on("data", (chunk) => {
 
 STDIN.on("end", () => {
   endRequested = true;
-  queue.finally(() => realProcess.exit(0));
+  queue.finally(() => realProcess.exit(exitCodeForEnd()));
 });
 realProcess.on("uncaughtException", (error) => {
   log("uncaught exception", error.stack || error.message);
