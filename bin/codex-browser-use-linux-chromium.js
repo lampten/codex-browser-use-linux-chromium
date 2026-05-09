@@ -307,6 +307,13 @@ function planTextPatch(filePath, patcher) {
   return { filePath, before, after, changed: after !== before };
 }
 
+function planOptionalJsonPatch(filePath, patcher) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  const before = fs.readFileSync(filePath, "utf8");
+  const after = patcher(before);
+  return { filePath, before, after, changed: after !== before };
+}
+
 function replaceRequired(text, from, to, label) {
   if (text.includes(to)) return text;
   if (!text.includes(from)) {
@@ -499,6 +506,53 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);
 }
 
+function readJsonFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function resolvePluginMcpConfigPath(root) {
+  const manifestPath = path.join(root, ".codex-plugin", "plugin.json");
+  if (!fs.existsSync(manifestPath)) return null;
+  let manifest;
+  try {
+    manifest = readJsonFile(manifestPath);
+  } catch {
+    return null;
+  }
+  const mcpServers = manifest.mcpServers;
+  if (typeof mcpServers !== "string" || !mcpServers.startsWith("./")) return null;
+  const relativePath = mcpServers.slice(2);
+  if (!relativePath || relativePath.split(/[\\/]/).some((part) => part === ".." || part === "")) {
+    return null;
+  }
+  return path.join(root, relativePath);
+}
+
+function patchPluginMcpConfig(text, paths) {
+  let config;
+  try {
+    config = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Could not parse plugin MCP config: ${error.message}`);
+  }
+  const nodeRepl = config?.mcpServers?.node_repl;
+  if (!nodeRepl || typeof nodeRepl !== "object") return text;
+
+  const nodePath = commandPath("node") || process.execPath;
+  const nextConfig = {
+    ...config,
+    mcpServers: {
+      ...config.mcpServers,
+      node_repl: {
+        ...nodeRepl,
+        command: nodePath,
+        args: [paths.nodeReplMcp],
+      },
+    },
+  };
+  return `${JSON.stringify(nextConfig, null, 2)}\n`;
+}
+
 const BROWSER_USE_PLUGIN_PATCHES = [["scripts/browser-client.mjs", patchBrowserClient]];
 
 const CHROME_PLUGIN_PATCHES = [
@@ -515,7 +569,7 @@ function patchSetForRoot(root) {
   return pluginRootKind(root) === "chrome" ? CHROME_PLUGIN_PATCHES : BROWSER_USE_PLUGIN_PATCHES;
 }
 
-function planPluginRootPatch(root) {
+function planPluginRootPatch(root, paths) {
   assertPluginRoot(root);
   const kind = pluginRootKind(root);
   const results = [];
@@ -523,15 +577,20 @@ function planPluginRootPatch(root) {
     const filePath = path.join(root, relativePath);
     results.push(planTextPatch(filePath, patcher));
   }
+  const mcpConfigPath = resolvePluginMcpConfigPath(root);
+  const mcpPatch = planOptionalJsonPatch(mcpConfigPath, (text) =>
+    patchPluginMcpConfig(text, paths)
+  );
+  if (mcpPatch) results.push(mcpPatch);
   return { root, kind, results };
 }
 
-function planPluginPatches(args) {
+function planPluginPatches(args, paths = runtimePaths(args)) {
   const roots = detectPluginRoots(args);
   if (roots.length === 0) {
     return [];
   }
-  return roots.map(planPluginRootPatch);
+  return roots.map((root) => planPluginRootPatch(root, paths));
 }
 
 function commitPluginPatchPlans(plans, args) {
@@ -693,8 +752,9 @@ function escapeTomlString(value) {
 function install(args) {
   requireLinuxWrites(args);
   preflightInstall(args);
-  const pluginPatchPlans = planPluginPatches(args);
-  const paths = installRuntime(args);
+  const paths = runtimePaths(args);
+  const pluginPatchPlans = planPluginPatches(args, paths);
+  installRuntime(args);
   installNativeHostManifests(args, paths);
   commitPluginPatchPlans(pluginPatchPlans, args);
   if (args.writeCodexConfig) writeCodexConfig(args, paths);
@@ -721,7 +781,35 @@ function requireLinuxWrites(args) {
   throw new Error("Refusing to write on a non-Linux host. Run on the Linux remote host, use --dry-run, or pass --allow-non-linux for tests.");
 }
 
-function patchStatusForRoot(root) {
+function pluginMcpNodeReplStatus(root, paths) {
+  const mcpConfigPath = resolvePluginMcpConfigPath(root);
+  const status = {
+    path: mcpConfigPath,
+    exists: Boolean(mcpConfigPath && fs.existsSync(mcpConfigPath)),
+    nodeReplExists: false,
+    actualNodeReplPath: null,
+    pathMatches: true,
+  };
+  if (!status.exists) return status;
+
+  try {
+    const config = readJsonFile(mcpConfigPath);
+    const nodeRepl = config?.mcpServers?.node_repl;
+    status.nodeReplExists = Boolean(nodeRepl);
+    const firstArg = Array.isArray(nodeRepl?.args) ? nodeRepl.args[0] : null;
+    status.actualNodeReplPath = typeof firstArg === "string" ? firstArg : null;
+    status.pathMatches =
+      !status.nodeReplExists ||
+      (status.actualNodeReplPath != null &&
+        path.resolve(status.actualNodeReplPath) === path.resolve(paths.nodeReplMcp));
+  } catch (error) {
+    status.error = error.message;
+    status.pathMatches = false;
+  }
+  return status;
+}
+
+function patchStatusForRoot(root, paths) {
   const read = (relativePath) => {
     const filePath = path.join(root, relativePath);
     return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
@@ -731,6 +819,7 @@ function patchStatusForRoot(root) {
   const status = {
     root,
     kind,
+    pluginMcpNodeRepl: pluginMcpNodeReplStatus(root, paths),
     browserClientNativePipeFallback: /\?\?globalThis\.__codexNativePipe/.test(browserClient),
     browserClientNativePipeFallbackSyntax:
       !/\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)UnavailableMessage/.test(
@@ -831,7 +920,7 @@ function doctor(args) {
       path.join(DESKTOP_SHIM_DIRS[0], "node_repl"),
       path.join(DESKTOP_SHIM_DIRS[1], "node_repl"),
     ].map((shimPath) => ({ path: shimPath, exists: fs.existsSync(shimPath) })),
-    pluginRoots: pluginRoots.map(patchStatusForRoot),
+    pluginRoots: pluginRoots.map((root) => patchStatusForRoot(root, paths)),
   };
 
   if (args.json) {
@@ -878,8 +967,19 @@ function doctor(args) {
   for (const root of report.pluginRoots) {
     const ok = Object.entries(root)
       .filter(([key]) => !["root", "kind"].includes(key))
-      .every(([, value]) => value === true);
+      .every(([key, value]) => {
+        if (typeof value === "boolean") return value === true;
+        if (key === "pluginMcpNodeRepl") return value.pathMatches === true;
+        return true;
+      });
     console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.kind} ${root.root}`);
+    if (root.pluginMcpNodeRepl.exists && root.pluginMcpNodeRepl.nodeReplExists) {
+      console.log(
+        `  plugin mcp node_repl: ${
+          root.pluginMcpNodeRepl.pathMatches ? "ok" : "mismatch"
+        } ${root.pluginMcpNodeRepl.path}`
+      );
+    }
   }
 }
 
