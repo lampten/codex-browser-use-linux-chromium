@@ -311,7 +311,14 @@ function planOptionalJsonPatch(filePath, patcher) {
   if (!filePath || !fs.existsSync(filePath)) return null;
   const before = fs.readFileSync(filePath, "utf8");
   const after = patcher(before);
-  return { filePath, before, after, changed: after !== before };
+  return { filePath, before, after, changed: after !== before, exists: true };
+}
+
+function planGeneratedJsonPatch(filePath, patcher) {
+  const exists = fs.existsSync(filePath);
+  const before = exists ? fs.readFileSync(filePath, "utf8") : "{}\n";
+  const after = patcher(before);
+  return { filePath, before, after, changed: !exists || after !== before, exists };
 }
 
 function replaceRequired(text, from, to, label) {
@@ -352,6 +359,37 @@ function patchBrowserClient(text) {
     )
   ) {
     throw new Error("Native pipe fallback patch produced malformed UnavailableMessage access");
+  }
+  return output;
+}
+
+const BROWSER_USE_IAB_CHROME_ROUTING_MARKER =
+  "codex-browser-use-linux-chromium: browser-use-iab-routes-to-chrome";
+
+function patchBrowserUseClient(text) {
+  let output = patchBrowserClient(text);
+  if (
+    !output.includes('extension:"iab"') ||
+    !output.includes('case"extension":return"iab"')
+  ) {
+    const backendAliasPattern =
+      /var ([A-Za-z_$][A-Za-z0-9_$]*)=\{cdp:"cdp",extension:"chrome",iab:"iab"\};/;
+    if (!backendAliasPattern.test(output)) {
+      throw new Error("Could not find patch point for Browser Use extension backend allowlist alias");
+    }
+    output = output.replace(
+      backendAliasPattern,
+      'var $1={cdp:"cdp",extension:"iab",iab:"iab"};'
+    );
+    output = replaceRequired(
+      output,
+      'case"extension":return"extension";',
+      'case"extension":return"iab";',
+      "Browser Use extension backend browser type alias"
+    );
+  }
+  if (!output.includes(BROWSER_USE_IAB_CHROME_ROUTING_MARKER)) {
+    output = `/* ${BROWSER_USE_IAB_CHROME_ROUTING_MARKER} */\n${output}`;
   }
   return output;
 }
@@ -464,6 +502,25 @@ function patchOpenChromeWindow(text) {
 
 const SCREENSHOT_OUTPUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: screenshot-output-compatibility";
+const BROWSER_SKILL_ROUTING_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-skill-routes-iab-to-chrome";
+
+function patchBrowserSkill(text) {
+  if (text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER)) return text;
+  const bootstrapHeader = /\r?\n## Bootstrap/;
+  if (!bootstrapHeader.test(text)) {
+    throw new Error("Could not find patch point for Browser skill Linux Chromium routing instructions");
+  }
+  const section = `
+## Linux Chromium Compatibility
+
+<!-- ${BROWSER_SKILL_ROUTING_PATCH_MARKER} -->
+
+On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the normal \`iab\` Browser workflow. The local runtime maps \`iab\` to the Chromium-backed Codex Chrome Extension because Linux remote hosts do not have a Codex Desktop in-app browser. Do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
+
+`;
+  return text.replace(bootstrapHeader, `${section}## Bootstrap`);
+}
 
 function patchChromeSkill(text) {
   if (
@@ -535,16 +592,20 @@ function patchPluginMcpConfig(text, paths) {
   } catch (error) {
     throw new Error(`Could not parse plugin MCP config: ${error.message}`);
   }
-  const nodeRepl = config?.mcpServers?.node_repl;
-  if (!nodeRepl || typeof nodeRepl !== "object") return text;
+  const mcpServers =
+    config?.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers : {};
+  const nodeRepl = mcpServers.node_repl;
+  if (nodeRepl && typeof nodeRepl !== "object") {
+    throw new Error("plugin MCP config node_repl entry is not an object");
+  }
 
   const nodePath = commandPath("node") || process.execPath;
   const nextConfig = {
     ...config,
     mcpServers: {
-      ...config.mcpServers,
+      ...mcpServers,
       node_repl: {
-        ...nodeRepl,
+        ...(nodeRepl || {}),
         command: nodePath,
         args: [paths.nodeReplMcp],
       },
@@ -553,9 +614,33 @@ function patchPluginMcpConfig(text, paths) {
   return `${JSON.stringify(nextConfig, null, 2)}\n`;
 }
 
-const BROWSER_USE_PLUGIN_PATCHES = [["scripts/browser-client.mjs", patchBrowserClient]];
+function patchPluginJsonMcpServers(text) {
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Could not parse plugin.json: ${error.message}`);
+  }
+  if (manifest.mcpServers && manifest.mcpServers !== "./.mcp.json") {
+    throw new Error(
+      `plugin.json already has unsupported mcpServers value: ${manifest.mcpServers}`
+    );
+  }
+  const nextManifest = {
+    ...manifest,
+    mcpServers: "./.mcp.json",
+  };
+  return `${JSON.stringify(nextManifest, null, 2)}\n`;
+}
+
+const BROWSER_USE_PLUGIN_PATCHES = [
+  [".codex-plugin/plugin.json", patchPluginJsonMcpServers],
+  ["scripts/browser-client.mjs", patchBrowserUseClient],
+  ["skills/browser/SKILL.md", patchBrowserSkill],
+];
 
 const CHROME_PLUGIN_PATCHES = [
+  [".codex-plugin/plugin.json", patchPluginJsonMcpServers],
   ["scripts/browser-client.mjs", patchBrowserClient],
   ["scripts/installed-browsers.js", patchInstalledBrowsers],
   ["scripts/chrome-is-running.js", patchChromeIsRunning],
@@ -577,8 +662,8 @@ function planPluginRootPatch(root, paths) {
     const filePath = path.join(root, relativePath);
     results.push(planTextPatch(filePath, patcher));
   }
-  const mcpConfigPath = resolvePluginMcpConfigPath(root);
-  const mcpPatch = planOptionalJsonPatch(mcpConfigPath, (text) =>
+  const mcpConfigPath = resolvePluginMcpConfigPath(root) || path.join(root, ".mcp.json");
+  const mcpPatch = planGeneratedJsonPatch(mcpConfigPath, (text) =>
     patchPluginMcpConfig(text, paths)
   );
   if (mcpPatch) results.push(mcpPatch);
@@ -602,7 +687,7 @@ function commitPluginPatchPlans(plans, args) {
   for (const plan of plans) {
     for (const file of plan.results) {
       if (!file.changed) continue;
-      backupFile(file.filePath, args);
+      if (file.exists !== false && fs.existsSync(file.filePath)) backupFile(file.filePath, args);
       writeFile(file.filePath, file.after, null, args);
     }
   }
@@ -826,7 +911,19 @@ function patchStatusForRoot(root, paths) {
         browserClient
       ),
   };
-  if (kind !== "chrome") return status;
+  if (kind !== "chrome") {
+    const browserSkill = read("skills/browser/SKILL.md");
+    const pluginJson = read(".codex-plugin/plugin.json");
+    return {
+      ...status,
+      browserUseIabRoutesToChrome:
+        browserClient.includes(BROWSER_USE_IAB_CHROME_ROUTING_MARKER) &&
+        browserClient.includes('extension:"iab"') &&
+        browserClient.includes('case"extension":return"iab"'),
+      browserSkillRoutesIabToChrome: browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER),
+      browserUsePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
+    };
+  }
 
   const installedBrowsers = read("scripts/installed-browsers.js");
   const chromeIsRunning = read("scripts/chrome-is-running.js");
@@ -834,8 +931,10 @@ function patchStatusForRoot(root, paths) {
   const nativeHostManifest = read("scripts/check-native-host-manifest.js");
   const openWindow = read("scripts/open-chrome-window.js");
   const chromeSkill = read("skills/chrome/SKILL.md");
+  const pluginJson = read(".codex-plugin/plugin.json");
   return {
     ...status,
+    chromePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
     installedBrowsersChromium:
       /name:\s*"Chromium"[\s\S]*commands:\s*\[[^\]]*"chromium"[^\]]*"chromium-browser"/.test(
         installedBrowsers

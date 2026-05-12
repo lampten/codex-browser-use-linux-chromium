@@ -24,14 +24,21 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   deliverables as visible file artifacts.
 - Accepts the official Node REPL `js` call shape, including optional `title`
   and per-call `timeout_ms`/`timeoutMs` fields.
+- Cleans up native browser sockets after a `js` timeout, so a timed-out browser
+  command is less likely to poison follow-up tool calls in the same MCP process.
 - Gives each MCP process a unique Browser Use `session_id` and stable
   process-scoped `turn_id`, matching the isolation the official desktop runtime
   normally provides for browser-session state.
 - Patches locally cached Codex Browser Use / Chrome plugin scripts so they
   recognize Chromium on Linux.
-- Patches plugin-local `mcpServers` metadata when present, so Codex CLI 0.130+
-  Chrome plugin caches that declare their own `node_repl` use this runtime
-  instead of an older `codex-chrome-extension` path.
+- Patches plugin-local `mcpServers` metadata for both Chrome and Browser Use,
+  so Codex CLI 0.130+ plugin caches expose `node_repl` from the selected plugin
+  version directory instead of depending on a global or stale MCP entry.
+- On Linux, hard-routes the official `Browser` / `browser-use` `iab` backend
+  to the Chromium-backed extension backend. Linux remote hosts do not have the
+  Codex Desktop in-app browser, so `@browser` and frontend-testing skills need
+  this compatibility alias to use Chromium instead of failing before browser
+  setup.
 - Optionally installs macOS Desktop remote path shims under `/Applications/...`
   on the Linux host. This is needed when Codex Desktop on macOS remotely
   connects to the Linux host and sends its own `node_repl` path through
@@ -97,9 +104,10 @@ node bin/codex-browser-use-linux-chromium.js doctor
 - Patches discovered official Browser Use / Chrome plugin caches. Plugin
   patching is planned transactionally per plugin root: if any required patch
   point is missing, that plugin root is left untouched.
-- Updates a discovered plugin-local `.mcp.json` `node_repl` entry to the
-  installed runtime. This covers newer plugin caches whose `plugin.json`
-  contains `mcpServers`.
+- Updates or creates plugin-local `.mcp.json` `node_repl` entries pointing to
+  the installed runtime. The installer also adds `mcpServers` metadata to
+  Chrome and Browser Use plugin manifests when the official cache does not ship
+  it.
 - With `--desktop-shims`, creates Linux shims for macOS Codex Desktop remote
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`
@@ -194,8 +202,17 @@ JavaScript tool has a default 120 second timeout; override it with
 value to tune it. The `js` tool also accepts per-call `timeout_ms`/`timeoutMs`
 values, matching the official runtime's call shape. A timeout returns an MCP
 error but keeps the stdio transport open, so follow-up calls such as `js_reset`
-can still recover the session. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if
-you explicitly want timeout errors to terminate the MCP process.
+can still recover the session. By default the runtime destroys native browser
+pipe connections and resets the JS context after a timeout; set
+`CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` only if you need to preserve in-memory JS
+state across timeouts. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if you
+explicitly want timeout errors to terminate the MCP process.
+
+If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
+lines, the native host is sending commands to Chromium faster than Chromium is
+reading them. This version serializes native-host stdout writes and waits for
+`drain` before sending more frames. You can lower the fail-fast queue cap with
+`CODEX_NATIVE_HOST_MAX_CHROME_QUEUE_BYTES`; the default is 64 MiB.
 
 If a screenshot task says it succeeded but no image appears in the final
 assistant message, check whether the final message references

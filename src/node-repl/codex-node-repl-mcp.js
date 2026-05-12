@@ -32,11 +32,13 @@ const JS_TIMEOUT_MS = parseNonNegativeInt(realProcess.env.CODEX_NODE_REPL_JS_TIM
 const EXIT_ON_TIMEOUT = /^(1|true|yes)$/i.test(
   realProcess.env.CODEX_NODE_REPL_EXIT_ON_TIMEOUT || ""
 );
+const RESET_ON_TIMEOUT = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_NODE_REPL_RESET_ON_TIMEOUT || ""
+);
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
 let context = null;
-let responseMeta = {};
 let lastEmittedImages = [];
 let imageCounter = 0;
 let queue = Promise.resolve();
@@ -103,13 +105,17 @@ function makeRequestMeta() {
   };
 }
 
-function makeNativePipe() {
+function makeNativePipe(nativeConnections) {
   return {
     createConnection(socketPath) {
       if (typeof socketPath !== "string" || socketPath.length === 0) {
         throw new Error("createConnection requires a Unix socket path");
       }
-      return net.createConnection(socketPath);
+      const socket = net.createConnection(socketPath);
+      nativeConnections.add(socket);
+      socket.once("close", () => nativeConnections.delete(socket));
+      socket.on("error", (error) => log("native pipe socket error", error.message));
+      return socket;
     },
   };
 }
@@ -192,16 +198,34 @@ function saveParsedImage(image, optionsOrFileName) {
   return targetPath;
 }
 
+function disposeContextResources(targetContext = context, reason = "reset") {
+  const nativeConnections = targetContext?.__nativeConnections;
+  if (!nativeConnections || nativeConnections.size === 0) return;
+
+  const count = nativeConnections.size;
+  for (const socket of [...nativeConnections]) {
+    try {
+      socket.destroy();
+    } catch {
+      // Best effort cleanup for timed-out browser calls.
+    }
+  }
+  nativeConnections.clear();
+  log("disposed context resources", `reason=${reason} native_connections=${count}`);
+}
+
 function resetContext() {
+  disposeContextResources(context, "reset");
   fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
-  responseMeta = {};
   lastEmittedImages = [];
 
   const emittedImages = [];
   const savedImagePaths = [];
   const logs = [];
   const writes = [];
-  const nativePipe = makeNativePipe();
+  const nativeConnections = new Set();
+  const nativePipe = makeNativePipe(nativeConnections);
+  const state = { responseMeta: {} };
 
   globalThis.__codexNativePipe = nativePipe;
 
@@ -221,7 +245,7 @@ function resetContext() {
       writes.push(String(text));
     },
     setResponseMeta(meta) {
-      responseMeta = { ...responseMeta, ...(meta || {}) };
+      state.responseMeta = { ...state.responseMeta, ...(meta || {}) };
     },
     saveImage(imageLike, options) {
       const image = parseImage(imageLike);
@@ -281,6 +305,8 @@ function resetContext() {
     __dynamicImport: (specifier) => importFromCwd(specifier, nodeRepl.cwd),
     require,
     savedImagePaths,
+    __nativeConnections: nativeConnections,
+    __state: state,
   };
   context.globalThis = context;
   context.global = context;
@@ -303,13 +329,14 @@ async function runJs(code) {
   if (context == null) resetContext();
   if (typeof code !== "string") throw new Error("js requires a string code argument");
 
-  context.nodeRepl.requestMeta = makeRequestMeta();
-  globalThis.nodeRepl = context.nodeRepl;
-  globalThis.__codexNativePipe = context.__codexNativePipe;
-  responseMeta = {};
-  context.__logs.length = 0;
-  context.__writes.length = 0;
-  context.emittedImages.length = 0;
+  const runContext = context;
+  runContext.nodeRepl.requestMeta = makeRequestMeta();
+  globalThis.nodeRepl = runContext.nodeRepl;
+  globalThis.__codexNativePipe = runContext.__codexNativePipe;
+  runContext.__state.responseMeta = {};
+  runContext.__logs.length = 0;
+  runContext.__writes.length = 0;
+  runContext.emittedImages.length = 0;
 
   const fn = new AsyncFunction(
     "globalThis",
@@ -323,21 +350,21 @@ ${code}
 `
   );
 
-  const result = await fn(context, (specifier) => importFromCwd(specifier, context.nodeRepl.cwd));
+  const result = await fn(runContext, (specifier) => importFromCwd(specifier, runContext.nodeRepl.cwd));
   const content = [];
   const text = [];
-  const images = context.emittedImages.slice();
+  const images = runContext.emittedImages.slice();
   if (images.length > 0) {
     lastEmittedImages = images;
   } else if (shouldReplayLastImagesAfterCleanup(code, result)) {
     images.push(...lastEmittedImages);
   }
 
-  if (context.__writes.length > 0) text.push(context.__writes.join(""));
-  if (context.__logs.length > 0) text.push(context.__logs.join("\n"));
+  if (runContext.__writes.length > 0) text.push(runContext.__writes.join(""));
+  if (runContext.__logs.length > 0) text.push(runContext.__logs.join("\n"));
   if (result !== undefined) text.push(formatValue(result));
-  if (Object.keys(responseMeta).length > 0) {
-    text.push(`responseMeta: ${JSON.stringify(responseMeta)}`);
+  if (Object.keys(runContext.__state.responseMeta).length > 0) {
+    text.push(`responseMeta: ${JSON.stringify(runContext.__state.responseMeta)}`);
   }
   if (text.length > 0) content.push({ type: "text", text: text.join("\n") });
   if (content.length === 0 && images.length === 0) {
@@ -368,7 +395,7 @@ class JsTimeoutError extends Error {
   }
 }
 
-async function withTimeoutMs(promise, timeoutMs) {
+async function withTimeoutMs(promise, timeoutMs, onTimeout) {
   if (!timeoutMs) return promise;
 
   let timer = null;
@@ -376,7 +403,14 @@ async function withTimeoutMs(promise, timeoutMs) {
     return await Promise.race([
       promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new JsTimeoutError(timeoutMs)), timeoutMs);
+        timer = setTimeout(() => {
+          try {
+            onTimeout?.();
+          } catch (error) {
+            log("timeout cleanup failed", error.stack || error.message);
+          }
+          reject(new JsTimeoutError(timeoutMs));
+        }, timeoutMs);
         timer.unref?.();
       }),
     ]);
@@ -388,6 +422,13 @@ async function withTimeoutMs(promise, timeoutMs) {
 function jsTimeoutFromArgs(args = {}) {
   const perCallTimeout = args.timeout_ms ?? args.timeoutMs;
   return parseNonNegativeInt(perCallTimeout, JS_TIMEOUT_MS);
+}
+
+function summarizeJsArgs(args = {}) {
+  const title = typeof args.title === "string" && args.title.trim() ? args.title.trim() : "untitled";
+  const code = typeof args.code === "string" ? args.code.replace(/\s+/g, " ").trim() : "";
+  const codePrefix = code.length > 160 ? `${code.slice(0, 160)}...` : code;
+  return `title=${JSON.stringify(title)} code=${JSON.stringify(codePrefix)}`;
 }
 
 function scheduleTimeoutExit() {
@@ -453,7 +494,22 @@ function sendError(id, error) {
 }
 
 async function callTool(name, args = {}) {
-  if (name === "js") return withTimeoutMs(runJs(args.code), jsTimeoutFromArgs(args));
+  if (name === "js") {
+    const timeoutMs = jsTimeoutFromArgs(args);
+    const startedAt = Date.now();
+    log("js call started", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
+    try {
+      return await withTimeoutMs(runJs(args.code), timeoutMs, () => {
+        log("js timeout cleanup", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
+        if (RESET_ON_TIMEOUT) {
+          disposeContextResources(context, "timeout");
+          context = null;
+        }
+      });
+    } finally {
+      log("js call finished", `duration_ms=${Date.now() - startedAt} ${summarizeJsArgs(args)}`);
+    }
+  }
   if (name === "js_reset") {
     resetContext();
     return { content: [{ type: "text", text: "reset" }] };

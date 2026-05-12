@@ -23,6 +23,26 @@ The project intentionally does not implement browser automation as a separate
 replacement API. It only recreates enough of the official Node REPL runtime for
 the official Browser Use client code to run.
 
+## Browser vs Chrome Routing
+
+Codex currently ships two related browser plugin surfaces:
+
+- `Chrome`, which targets the user's Chrome browser through the official Codex
+  Chrome extension.
+- `Browser` / `browser-use`, which targets the Codex Desktop in-app browser
+  backend named `iab`.
+
+On a Linux remote host there is no Codex Desktop app and therefore no real
+`iab` browser. The installer patches the local `browser-use` plugin cache so
+that `iab` is treated as an alias for the Chromium extension backend. This lets
+official Browser skill code such as `agent.browsers.get("iab")` continue to
+work while using Chromium behind the scenes.
+
+This routing patch is intentionally Linux-local. It does not make the host show
+up as a first-class Codex Desktop in-app browser, and it does not change the
+closed-source app UI. It only makes the plugin runtime on the remote CLI host
+resolve Browser requests to the available Chromium-backed extension transport.
+
 ## Approval Boundaries
 
 The official desktop provider has an app-level approval layer for opening
@@ -59,7 +79,18 @@ The `js` tool also has a process-level timeout controlled by
 `CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 120000 ms. When a JavaScript
 call times out, the MCP server returns an error but keeps its stdio transport
 open so the same Codex turn can still run recovery calls such as `js_reset`.
-Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` to restore exit-on-timeout behavior.
+After a timeout, the compatibility runtime destroys native browser pipe sockets
+and resets the JS context by default; this prevents the timed-out Browser Use
+promise from continuing to occupy the extension channel while later calls run.
+Set `CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` to preserve the old behavior, or
+`CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` to restore exit-on-timeout behavior.
+
+The native host bridge also serializes writes to Chromium stdout and waits for
+Node's `drain` event when the Chrome native-messaging pipe reports backpressure.
+This is important for screenshot-heavy or retry-heavy browser tasks: without
+write-side flow control, commands can pile up behind Chromium and appear as
+frequent per-call `js` timeouts even though the MCP transport itself remains
+open.
 
 ## Install Safety
 

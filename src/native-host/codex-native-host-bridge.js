@@ -21,6 +21,15 @@ const IS_LE = os.endianness() === "LE";
 let nextClientId = 1;
 const clients = new Set();
 const pendingRequests = new Map();
+const chromeWriteQueue = [];
+let chromeWriteQueueBytes = 0;
+let chromeWriteDraining = false;
+let stdoutBackpressureEvents = 0;
+let lastStdoutBackpressureLogAt = 0;
+const MAX_CHROME_WRITE_QUEUE_BYTES = parseIntEnv(
+  "CODEX_NATIVE_HOST_MAX_CHROME_QUEUE_BYTES",
+  64 * 1024 * 1024
+);
 
 function log(message, extra) {
   const line = `${new Date().toISOString()} ${message}${extra ? ` ${extra}` : ""}\n`;
@@ -37,6 +46,13 @@ function readLength(buffer, offset = 0) {
 
 function writeLength(buffer, value, offset = 0) {
   return IS_LE ? buffer.writeUInt32LE(value, offset) : buffer.writeUInt32BE(value, offset);
+}
+
+function parseIntEnv(name, fallback) {
+  const value = process.env[name];
+  if (value == null || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : fallback;
 }
 
 function encodeMessage(message) {
@@ -77,10 +93,64 @@ function hasId(message) {
   return message && Object.prototype.hasOwnProperty.call(message, "id");
 }
 
-function sendToChrome(message) {
+function logStdoutBackpressure() {
+  stdoutBackpressureEvents += 1;
+  const now = Date.now();
+  if (now - lastStdoutBackpressureLogAt < 1000) return;
+  lastStdoutBackpressureLogAt = now;
+  const suppressed = stdoutBackpressureEvents - 1;
+  stdoutBackpressureEvents = 0;
+  log(
+    "stdout backpressure",
+    `queue=${chromeWriteQueue.length} bytes=${chromeWriteQueueBytes}${
+      suppressed > 0 ? ` suppressed=${suppressed}` : ""
+    }`
+  );
+}
+
+function enqueueChromeWrite(message, ownerClient = null, pendingId = null) {
   const frame = encodeMessage(message);
-  if (!process.stdout.write(frame)) {
-    log("stdout backpressure");
+  chromeWriteQueue.push({ frame, ownerClient, pendingId });
+  chromeWriteQueueBytes += frame.length;
+
+  if (chromeWriteQueueBytes > MAX_CHROME_WRITE_QUEUE_BYTES) {
+    log(
+      "chrome write queue limit exceeded",
+      `bytes=${chromeWriteQueueBytes} limit=${MAX_CHROME_WRITE_QUEUE_BYTES}`
+    );
+    if (ownerClient) ownerClient.socket.destroy(new Error("native host chrome write queue overflow"));
+    else shutdown(1);
+    return;
+  }
+
+  drainChromeWrites();
+}
+
+function drainChromeWrites() {
+  if (chromeWriteDraining) return;
+  chromeWriteDraining = true;
+
+  for (;;) {
+    const entry = chromeWriteQueue.shift();
+    if (!entry) {
+      chromeWriteDraining = false;
+      return;
+    }
+
+    chromeWriteQueueBytes -= entry.frame.length;
+    if (entry.ownerClient && !clients.has(entry.ownerClient)) {
+      if (entry.pendingId) pendingRequests.delete(entry.pendingId);
+      continue;
+    }
+
+    if (!process.stdout.write(entry.frame)) {
+      logStdoutBackpressure();
+      process.stdout.once("drain", () => {
+        chromeWriteDraining = false;
+        drainChromeWrites();
+      });
+      return;
+    }
   }
 }
 
@@ -124,11 +194,11 @@ function forwardClientMessage(client, message) {
   if (hasId(message)) {
     const bridgeId = `codex-bridge:${client.id}:${String(message.id)}`;
     pendingRequests.set(bridgeId, { client, originalId: message.id });
-    sendToChrome({ ...message, id: bridgeId });
+    enqueueChromeWrite({ ...message, id: bridgeId }, client, bridgeId);
     return;
   }
 
-  sendToChrome(message);
+  enqueueChromeWrite(message, client);
 }
 
 function forwardChromeMessage(message) {
