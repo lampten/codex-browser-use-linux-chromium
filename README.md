@@ -26,6 +26,9 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   and per-call `timeout_ms`/`timeoutMs` fields.
 - Cleans up native browser sockets after a `js` timeout, so a timed-out browser
   command is less likely to poison follow-up tool calls in the same MCP process.
+- Restarts the native host bridge when a client disconnects with an in-flight
+  browser command, which clears orphaned screenshot/DOM commands that can later
+  surface as `Detached while handling command`.
 - Adds skill guidance so agents stop retrying the same page-level browser
   operation after repeated `tab.playwright` / `tab.cua` / input timeouts.
 - Gives each MCP process a unique Browser Use `session_id` and stable
@@ -278,6 +281,12 @@ lines, the native host is sending commands to Chromium faster than Chromium is
 reading them. This version serializes native-host stdout writes and waits for
 `drain` before sending more frames. You can lower the fail-fast queue cap with
 `CODEX_NATIVE_HOST_MAX_CHROME_QUEUE_BYTES`; the default is 64 MiB.
+
+When a REPL timeout disconnects while a browser command is still pending, the
+native host bridge exits by default so Chromium restarts it with a clean command
+pipe. This prevents orphaned screenshot or DOM commands from causing later
+`Detached while handling command` failures. Set
+`CODEX_NATIVE_HOST_EXIT_ON_ORPHANED_PENDING=0` to preserve the old behavior.
 
 If a screenshot task says it succeeded but no image appears in the final
 assistant message, check whether the final message references

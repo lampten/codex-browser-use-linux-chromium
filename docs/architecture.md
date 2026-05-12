@@ -149,6 +149,15 @@ write-side flow control, commands can pile up behind Chromium and appear as
 frequent per-call `js` timeouts even though the MCP transport itself remains
 open.
 
+If a client disconnects while the bridge still has a pending request for that
+client, the bridge exits by default. This usually means the REPL timed out and
+destroyed its socket while Chromium was still processing a page-level command
+such as `domSnapshot` or screenshot. Keeping the native host alive in that state
+can leave an orphaned extension/CDP command that later fails as `Detached while
+handling command`; restarting the bridge forces Chromium to establish a clean
+native-messaging pipe. Set `CODEX_NATIVE_HOST_EXIT_ON_ORPHANED_PENDING=0` to
+disable this recovery behavior.
+
 ## Install Safety
 
 The installer plans all plugin script edits for a plugin root before writing any

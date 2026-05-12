@@ -30,6 +30,9 @@ const MAX_CHROME_WRITE_QUEUE_BYTES = parseIntEnv(
   "CODEX_NATIVE_HOST_MAX_CHROME_QUEUE_BYTES",
   64 * 1024 * 1024
 );
+const EXIT_ON_ORPHANED_PENDING = !/^(0|false|no)$/i.test(
+  process.env.CODEX_NATIVE_HOST_EXIT_ON_ORPHANED_PENDING || ""
+);
 
 function log(message, extra) {
   const line = `${new Date().toISOString()} ${message}${extra ? ` ${extra}` : ""}\n`;
@@ -218,9 +221,14 @@ function forwardChromeMessage(message) {
 }
 
 function removePendingForClient(client) {
+  let removed = 0;
   for (const [id, pending] of pendingRequests) {
-    if (pending.client === client) pendingRequests.delete(id);
+    if (pending.client === client) {
+      pendingRequests.delete(id);
+      removed += 1;
+    }
   }
+  return removed;
 }
 
 function ensureSocketDirectory() {
@@ -279,8 +287,18 @@ const server = net.createServer((socket) => {
   socket.on("error", (error) => log("client socket error", `id=${client.id} ${error.message}`));
   socket.on("close", () => {
     clients.delete(client);
-    removePendingForClient(client);
-    log("client disconnected", `id=${client.id}`);
+    const orphanedPending = removePendingForClient(client);
+    log(
+      "client disconnected",
+      `id=${client.id}${orphanedPending > 0 ? ` orphaned_pending=${orphanedPending}` : ""}`
+    );
+    if (orphanedPending > 0 && EXIT_ON_ORPHANED_PENDING) {
+      log(
+        "orphaned pending request",
+        `id=${client.id} restarting native host bridge to clear in-flight browser command`
+      );
+      setImmediate(() => shutdown(0));
+    }
   });
 });
 
