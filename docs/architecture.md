@@ -23,6 +23,26 @@ The project intentionally does not implement browser automation as a separate
 replacement API. It only recreates enough of the official Node REPL runtime for
 the official Browser Use client code to run.
 
+## Codex 0.130 Tool Discovery
+
+Codex 0.130 changed MCP tool exposure so small sets of non-app MCP tools can be
+registered directly instead of being listed in `tool_search`. That is valid for
+normal MCP usage, but it is brittle for this compatibility layer because the
+official Chrome and Browser skills first discover `node_repl/js` through the
+searchable tool surface.
+
+The installer therefore enables:
+
+```toml
+[features]
+tool_search_always_defer_mcp_tools = true
+```
+
+With that flag, `node_repl/js` and `node_repl/js_reset` stay discoverable
+through `tool_search` in new turns. `doctor` reports the flag separately from
+native-host and plugin-cache status so a missing JS tool is not misdiagnosed as
+a Chromium path problem.
+
 ## Browser vs Chrome Routing
 
 Codex currently ships two related browser plugin surfaces:

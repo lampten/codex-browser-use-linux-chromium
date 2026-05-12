@@ -12,6 +12,7 @@ const DEFAULT_EXTENSION_ID = "hehggadaopoacecdllhhajmbjkdcmajg";
 const DEFAULT_NATIVE_HOST_NAME = "com.openai.codexextension";
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const BACKUP_SUFFIX = ".codex-browser-use-linux-chromium.bak.";
+const TOOL_SEARCH_DEFER_FEATURE = "tool_search_always_defer_mcp_tools";
 const DESKTOP_SHIM_DIRS = [
   "/Applications/Codex.app/Contents/Resources",
   "/Applications/Codex (Beta).app/Contents/Resources",
@@ -33,6 +34,7 @@ Options:
   --native-host-name NAME    Native host name. Default: ${DEFAULT_NATIVE_HOST_NAME}
   --system-native-host       Also install system Chromium/Chrome native host manifests.
   --desktop-shims            Install macOS Codex Desktop remote path shims.
+  --skip-feature-config      Do not update Codex feature flags in config.toml.
   --write-codex-config       Add or update a known node_repl MCP block in config.toml.
   --allow-non-linux          Allow writes on non-Linux hosts. Intended for tests.
   --dry-run                  Print actions without writing.
@@ -69,6 +71,7 @@ function parseArgs(argv) {
     else if (arg === "--native-host-name") args.nativeHostName = next();
     else if (arg === "--system-native-host") args.systemNativeHost = true;
     else if (arg === "--desktop-shims") args.desktopShims = true;
+    else if (arg === "--skip-feature-config") args.skipFeatureConfig = true;
     else if (arg === "--write-codex-config") args.writeCodexConfig = true;
     else if (arg === "--allow-non-linux") args.allowNonLinux = true;
     else if (arg === "--dry-run") args.dryRun = true;
@@ -754,6 +757,54 @@ function existingPath(filePath) {
   return fs.existsSync(filePath) ? filePath : null;
 }
 
+function writeCodexFeatureConfig(args) {
+  const configPath = path.join(args.codexHome, "config.toml");
+  const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+  const updated = ensureTomlFeatureFlag(existing, TOOL_SEARCH_DEFER_FEATURE, true);
+  if (updated === existing) {
+    logAction(args, `config.toml ${TOOL_SEARCH_DEFER_FEATURE} already enabled`);
+    return false;
+  }
+  if (args.dryRun) {
+    logAction(args, `enable ${TOOL_SEARCH_DEFER_FEATURE} in ${configPath}`);
+    return true;
+  }
+  mkdirp(path.dirname(configPath), args);
+  fs.writeFileSync(configPath, updated);
+  return true;
+}
+
+function ensureTomlFeatureFlag(text, key, enabled) {
+  const value = enabled ? "true" : "false";
+  const keyLine = `${key} = ${value}`;
+  const existingLine = new RegExp(`(^|\\r?\\n)(\\s*${escapeRegExp(key)}\\s*=\\s*)(true|false)(\\s*(?:#.*)?)(?=\\r?\\n|$)`);
+  if (existingLine.test(text)) {
+    return text.replace(existingLine, (_match, prefix, assignment, _oldValue, suffix) => {
+      return `${prefix}${assignment}${value}${suffix}`;
+    });
+  }
+
+  const features = findTomlTable(text, "features");
+  if (features) {
+    const insertAt = features.start + "[features]".length;
+    const newline = text.slice(insertAt, insertAt + 2) === "\r\n" ? "\r\n" : "\n";
+    return `${text.slice(0, insertAt)}${newline}${keyLine}${text.slice(insertAt)}`;
+  }
+
+  const prefix = text.length === 0 ? "" : text.endsWith("\n") ? "\n" : "\n\n";
+  return `${text}${prefix}[features]\n${keyLine}\n`;
+}
+
+function codexFeatureFlagStatus(text, key) {
+  const line = new RegExp(`(^|\\r?\\n)\\s*${escapeRegExp(key)}\\s*=\\s*(true|false)\\s*(?:#.*)?(?=\\r?\\n|$)`).exec(
+    text
+  );
+  return {
+    exists: Boolean(line),
+    enabled: line ? line[2] === "true" : false,
+  };
+}
+
 function writeCodexConfig(args, paths) {
   const configPath = path.join(args.codexHome, "config.toml");
   const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
@@ -842,6 +893,7 @@ function install(args) {
   installRuntime(args);
   installNativeHostManifests(args, paths);
   commitPluginPatchPlans(pluginPatchPlans, args);
+  if (!args.skipFeatureConfig) writeCodexFeatureConfig(args);
   if (args.writeCodexConfig) writeCodexConfig(args, paths);
   if (args.desktopShims) installDesktopShims(args, paths);
   logAction(args, "install complete");
@@ -1002,6 +1054,7 @@ function doctor(args) {
     browserConfigRoot: args.browserConfigRoot,
     codexConfig: {
       path: configPath,
+      toolSearchAlwaysDeferMcpTools: codexFeatureFlagStatus(configText, TOOL_SEARCH_DEFER_FEATURE),
       nodeReplMcp: nodeReplConfigBlockStatus(nodeReplConfig?.block || "", paths),
     },
     runtime: {
@@ -1034,6 +1087,11 @@ function doctor(args) {
   console.log(`codex: ${report.commands.codex || "not found"}`);
   console.log(`install root: ${report.installRoot}`);
   console.log(`browser config root: ${report.browserConfigRoot}`);
+  console.log(
+    `config ${TOOL_SEARCH_DEFER_FEATURE}: ${
+      report.codexConfig.toolSearchAlwaysDeferMcpTools.enabled ? "ok" : "missing/disabled"
+    } ${report.codexConfig.path}`
+  );
   console.log(
     `config node_repl: ${
       report.codexConfig.nodeReplMcp.pathMatches

@@ -108,6 +108,10 @@ node bin/codex-browser-use-linux-chromium.js doctor
   the installed runtime. The installer also adds `mcpServers` metadata to
   Chrome and Browser Use plugin manifests when the official cache does not ship
   it.
+- Enables `features.tool_search_always_defer_mcp_tools = true` in
+  `~/.codex/config.toml` so Codex 0.130+ exposes plugin MCP tools such as
+  `node_repl/js` through `tool_search`. Pass `--skip-feature-config` only if
+  you want to manage that feature flag yourself.
 - With `--desktop-shims`, creates Linux shims for macOS Codex Desktop remote
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`
@@ -132,7 +136,19 @@ directories.
 
 ## Optional Codex CLI Config
 
-For direct Codex CLI usage, add:
+The installer always enables this Codex 0.130+ compatibility flag unless
+`--skip-feature-config` is passed:
+
+```toml
+[features]
+tool_search_always_defer_mcp_tools = true
+```
+
+Without it, `node_repl` can be registered as a direct MCP tool but absent from
+`tool_search`, which makes Chrome/Browser skills report that no JS tool is
+available even though `codex mcp list` shows the server.
+
+For direct Codex CLI usage, also add:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js install --write-codex-config
