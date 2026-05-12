@@ -9,6 +9,12 @@ operation that points to the desktop app's local `node_repl` path. That path
 does not exist on the Linux host, so MCP startup fails before the model ever
 sees `mcp__node_repl__js`.
 
+The exact missing path depends on the desktop client. macOS usually sends
+`/Applications/Codex.app/Contents/Resources/node_repl` or the Beta app variant.
+Windows can send a path such as
+`C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe`.
+The installer can create Linux-side shims for both families.
+
 This project fills the Linux side:
 
 1. Chromium loads the official Codex Chrome extension.

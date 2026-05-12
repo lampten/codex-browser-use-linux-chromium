@@ -17,6 +17,14 @@ const DESKTOP_SHIM_DIRS = [
   "/Applications/Codex.app/Contents/Resources",
   "/Applications/Codex (Beta).app/Contents/Resources",
 ];
+const WINDOWS_DESKTOP_APP_DIRS = [
+  "Codex",
+  "Codex Beta",
+  "Codex (Beta)",
+  "OpenAI Codex",
+  "OpenAI Codex Beta",
+];
+const WINDOWS_NODE_REPL_NAMES = ["node_repl.exe", "node_repl"];
 
 function usage() {
   console.log(`Usage:
@@ -34,6 +42,10 @@ Options:
   --native-host-name NAME    Native host name. Default: ${DEFAULT_NATIVE_HOST_NAME}
   --system-native-host       Also install system Chromium/Chrome native host manifests.
   --desktop-shims            Install macOS Codex Desktop remote path shims.
+  --windows-shims            Install Windows Codex Desktop remote path shims.
+  --windows-username NAME    Windows username for generated shims. Can be repeated.
+  --windows-node-repl-path PATH
+                              Exact Windows node_repl command/path to shim. Can be repeated.
   --skip-feature-config      Do not update Codex feature flags in config.toml.
   --write-codex-config       Add or update a known node_repl MCP block in config.toml.
   --allow-non-linux          Allow writes on non-Linux hosts. Intended for tests.
@@ -48,6 +60,9 @@ function parseArgs(argv) {
     command: argv[0] || "doctor",
     pluginRoots: [],
     desktopShims: false,
+    windowsShims: false,
+    windowsUsernames: [],
+    windowsNodeReplPaths: [],
     systemNativeHost: false,
     writeCodexConfig: false,
     dryRun: false,
@@ -71,6 +86,9 @@ function parseArgs(argv) {
     else if (arg === "--native-host-name") args.nativeHostName = next();
     else if (arg === "--system-native-host") args.systemNativeHost = true;
     else if (arg === "--desktop-shims") args.desktopShims = true;
+    else if (arg === "--windows-shims") args.windowsShims = true;
+    else if (arg === "--windows-username") args.windowsUsernames.push(next());
+    else if (arg === "--windows-node-repl-path") args.windowsNodeReplPaths.push(next());
     else if (arg === "--skip-feature-config") args.skipFeatureConfig = true;
     else if (arg === "--write-codex-config") args.writeCodexConfig = true;
     else if (arg === "--allow-non-linux") args.allowNonLinux = true;
@@ -88,7 +106,23 @@ function parseArgs(argv) {
   args.extensionId = args.extensionId || DEFAULT_EXTENSION_ID;
   args.nativeHostName = args.nativeHostName || DEFAULT_NATIVE_HOST_NAME;
   args.pluginRoots = args.pluginRoots.map((root) => path.resolve(expandHome(root)));
+  args.windowsUsernames = defaultWindowsUsernames(args.windowsUsernames);
+  args.windowsNodeReplPaths = uniqueStrings(args.windowsNodeReplPaths.map(expandHome));
   return args;
+}
+
+function defaultWindowsUsernames(usernames) {
+  const localUser = os.userInfo().username || "";
+  const values = [...usernames, process.env.CODEX_WINDOWS_USERNAME || "", process.env.USERNAME || ""];
+  if (localUser) {
+    values.push(localUser);
+    values.push(localUser.charAt(0).toUpperCase() + localUser.slice(1));
+  }
+  return uniqueStrings(values.filter(Boolean));
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => String(value)).filter(Boolean))];
 }
 
 function expandHome(value) {
@@ -731,16 +765,22 @@ function writePrivilegedFile(targetFile, contents, mode, args) {
   }
 }
 
-function installDesktopShims(args, paths) {
+function nodeReplShimContents(args, paths) {
   const nodePath = commandPath("node") || process.execPath;
   const codexPath = resolveCodexPath() || "";
   const codexExport = codexPath ? `export CODEX_CLI_PATH="${codexPath}"\n` : "unset CODEX_CLI_PATH\n";
-  const shim = `#!/bin/sh
+  return `#!/bin/sh
 set -eu
 export CODEX_HOME="${args.codexHome}"
 ${codexExport}export NODE_REPL_NODE_PATH="${nodePath}"
 exec "${nodePath}" "${paths.nodeReplMcp}" "$@"
 `;
+}
+
+function installDesktopShims(args, paths) {
+  const nodePath = commandPath("node") || process.execPath;
+  const codexPath = resolveCodexPath() || "";
+  const shim = nodeReplShimContents(args, paths);
   for (const dir of DESKTOP_SHIM_DIRS) {
     writePrivilegedShim(path.join(dir, "node_repl"), shim, args);
     if (!args.dryRun) {
@@ -750,6 +790,59 @@ exec "${nodePath}" "${paths.nodeReplMcp}" "$@"
       logAction(args, `sudo ln -sfn ${nodePath} ${path.join(dir, "node")}`);
       if (codexPath) logAction(args, `sudo ln -sfn ${codexPath} ${path.join(dir, "codex")}`);
     }
+  }
+}
+
+function windowsNodeReplCommands(args) {
+  const commands = [...args.windowsNodeReplPaths];
+  for (const username of args.windowsUsernames) {
+    for (const appDir of WINDOWS_DESKTOP_APP_DIRS) {
+      for (const replName of WINDOWS_NODE_REPL_NAMES) {
+        commands.push(`C:\\Users\\${username}\\AppData\\Local\\Programs\\${appDir}\\resources\\${replName}`);
+        commands.push(`C:/Users/${username}/AppData/Local/Programs/${appDir}/resources/${replName}`);
+      }
+    }
+  }
+  return uniqueStrings(commands);
+}
+
+function userPathShimDirs() {
+  return uniqueStrings([
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), ".npm-global", "bin"),
+  ]);
+}
+
+function windowsShimTargetsForCommand(command) {
+  if (/^[A-Za-z]:[\\/]/.test(command)) {
+    if (command.includes("/")) {
+      return [path.join(os.homedir(), command)];
+    }
+    return userPathShimDirs().map((dir) => path.join(dir, command));
+  }
+  if (path.isAbsolute(command)) {
+    return [command];
+  }
+  if (command.includes("/")) {
+    return [path.join(os.homedir(), command)];
+  }
+  return userPathShimDirs().map((dir) => path.join(dir, command));
+}
+
+function windowsDesktopShimTargets(args) {
+  return windowsNodeReplCommands(args).flatMap((command) =>
+    windowsShimTargetsForCommand(command).map((targetPath) => ({
+      command,
+      path: targetPath,
+    }))
+  );
+}
+
+function installWindowsDesktopShims(args, paths) {
+  const shim = nodeReplShimContents(args, paths);
+  for (const target of windowsDesktopShimTargets(args)) {
+    writeFile(target.path, shim, 0o755, args);
+    logAction(args, `windows desktop shim: ${target.command} -> ${target.path}`);
   }
 }
 
@@ -896,6 +989,7 @@ function install(args) {
   if (!args.skipFeatureConfig) writeCodexFeatureConfig(args);
   if (args.writeCodexConfig) writeCodexConfig(args, paths);
   if (args.desktopShims) installDesktopShims(args, paths);
+  if (args.windowsShims) installWindowsDesktopShims(args, paths);
   logAction(args, "install complete");
 }
 
@@ -1072,6 +1166,11 @@ function doctor(args) {
       path.join(DESKTOP_SHIM_DIRS[0], "node_repl"),
       path.join(DESKTOP_SHIM_DIRS[1], "node_repl"),
     ].map((shimPath) => ({ path: shimPath, exists: fs.existsSync(shimPath) })),
+    windowsDesktopShims: windowsDesktopShimTargets(args).map((shim) => ({
+      command: shim.command,
+      path: shim.path,
+      exists: fs.existsSync(shim.path),
+    })),
     pluginRoots: pluginRoots.map((root) => patchStatusForRoot(root, paths)),
   };
 
@@ -1115,6 +1214,17 @@ function doctor(args) {
   }
   for (const shim of report.desktopShims) {
     console.log(`desktop shim: ${shim.exists ? "ok" : "missing"} ${shim.path}`);
+  }
+  const installedWindowsShims = report.windowsDesktopShims.filter((shim) => shim.exists);
+  console.log(`windows desktop shims: ${installedWindowsShims.length}/${report.windowsDesktopShims.length} installed`);
+  const displayedWindowsShims = installedWindowsShims.slice(0, 8);
+  for (const shim of displayedWindowsShims) {
+    console.log(
+      `  windows desktop shim: ok ${shim.command} -> ${shim.path}`
+    );
+  }
+  if (installedWindowsShims.length > displayedWindowsShims.length) {
+    console.log(`  ... ${installedWindowsShims.length - displayedWindowsShims.length} more installed Windows shims`);
   }
   for (const socket of report.browserUseSockets) {
     console.log(

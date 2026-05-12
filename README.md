@@ -43,6 +43,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   on the Linux host. This is needed when Codex Desktop on macOS remotely
   connects to the Linux host and sends its own `node_repl` path through
   `RefreshMcpServers`.
+- Optionally installs Windows Desktop remote path shims for common Codex and
+  Codex Beta install paths under `AppData\\Local\\Programs`. This is needed
+  when Codex Desktop on Windows sends a Windows-local `node_repl.exe` command
+  to the Linux app-server.
 
 ## Security and Approval Model
 
@@ -89,7 +93,7 @@ Override it with `--extension-id` if your extension ID differs.
 From the project directory on the Linux host:
 
 ```bash
-node bin/codex-browser-use-linux-chromium.js install --desktop-shims
+node bin/codex-browser-use-linux-chromium.js install --desktop-shims --windows-shims
 node bin/codex-browser-use-linux-chromium.js doctor
 ```
 
@@ -116,6 +120,13 @@ node bin/codex-browser-use-linux-chromium.js doctor
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`
   - `/Applications/Codex (Beta).app/Contents/Resources/node_repl`
+- With `--windows-shims`, creates Linux shims for common Windows Codex Desktop
+  remote paths, including stable and Beta paths under
+  `C:\\Users\\<name>\\AppData\\Local\\Programs\\...\\resources\\node_repl.exe`.
+  The installer generates both the local Linux username and a capitalized
+  variant; pass `--windows-username NAME` when the Windows account name differs.
+  Backslash-form Windows commands are installed into both `~/.local/bin` and
+  `~/.npm-global/bin`, so the app-server can find them through PATH.
 - With `--system-native-host`, writes system native host manifests:
   - `/etc/chromium/native-messaging-hosts/com.openai.codexextension.json`
   - `/etc/opt/chrome/native-messaging-hosts/com.openai.codexextension.json`
@@ -167,21 +178,27 @@ Codex Desktop remote sessions may still override MCP config via
 
 Windows Codex Desktop may send a Windows-local `node_repl` command path through
 `RefreshMcpServers`, for example a path under `AppData\\Local\\Programs`.
-That path varies by Windows username and install channel.
+That path varies by Windows username and install channel. Install the common
+Windows stable/Beta shims with:
 
-This project ships macOS path shims by default because those paths are stable:
-
-```text
-/Applications/Codex.app/Contents/Resources/node_repl
-/Applications/Codex (Beta).app/Contents/Resources/node_repl
+```bash
+node bin/codex-browser-use-linux-chromium.js install --windows-shims --windows-username YOUR_WINDOWS_USER
 ```
 
-For Windows clients, inspect the Linux host app-server log for the exact
-`RefreshMcpServers` `node_repl.command` value, then create a matching shim or
-alias that execs:
+If the Windows username matches the Linux username, `--windows-username` is not
+needed. The generated shims cover both backslash commands like:
 
 ```text
-~/.local/share/codex-browser-use-linux-chromium/node-repl/codex-node-repl-mcp.js
+C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe
+```
+
+and forward-slash variants like `C:/Users/Josh/.../node_repl.exe`. If Codex
+Desktop uses a custom install path, inspect the Linux host app-server log for
+the exact `RefreshMcpServers` `node_repl.command` value and pass it explicitly:
+
+```bash
+node bin/codex-browser-use-linux-chromium.js install --windows-shims \
+  --windows-node-repl-path 'C:\Users\Josh\AppData\Local\Programs\Custom Codex\resources\node_repl.exe'
 ```
 
 ## Restore Plugin Patches
