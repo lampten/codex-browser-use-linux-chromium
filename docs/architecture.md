@@ -61,6 +61,11 @@ server name and rewrites the Browser Use plugin's local MCP entry to
 two plugin surfaces still point to the same Linux runtime, but they no longer
 collide in Codex's plugin MCP registry.
 
+The Chrome skill patch explicitly tells agents not to use `browser_node_repl`
+for Chrome tasks. `browser_node_repl` exists only to keep the Browser /
+in-app-browser skill discoverable after Codex's duplicate MCP server-name
+de-duplication.
+
 There are two plugin roots to consider on Codex 0.130 remote hosts. The normal
 installed cache lives under `~/.codex/plugins/cache/...`, while Desktop remote
 turns may also load a staged bundled-marketplace copy under
@@ -129,6 +134,13 @@ and resets the JS context by default; this prevents the timed-out Browser Use
 promise from continuing to occupy the extension channel while later calls run.
 Set `CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` to preserve the old behavior, or
 `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` to restore exit-on-timeout behavior.
+
+Timeout errors include a `consecutive_js_timeouts` counter and a short recovery
+hint. The patched Browser and Chrome skills also tell agents to stop retrying
+the same page-level operation after repeated `tab.playwright`, `tab.cua`, fill,
+click, or keyboard timeouts when lightweight tab listing and URL/title reads
+still work. That pattern is a page-level bridge hang, not an MCP discovery
+failure.
 
 The native host bridge also serializes writes to Chromium stdout and waits for
 Node's `drain` event when the Chrome native-messaging pipe reports backpressure.

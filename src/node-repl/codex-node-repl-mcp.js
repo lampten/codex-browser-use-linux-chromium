@@ -44,6 +44,7 @@ let imageCounter = 0;
 let queue = Promise.resolve();
 let endRequested = false;
 let timeoutExitRequested = false;
+let consecutiveJsTimeouts = 0;
 
 function log(message, extra) {
   try {
@@ -387,15 +388,15 @@ function shouldReplayLastImagesAfterCleanup(code, result) {
 }
 
 class JsTimeoutError extends Error {
-  constructor(timeoutMs) {
+  constructor(timeoutMs, consecutiveTimeouts = 1) {
     super(
-      `js tool timed out after ${timeoutMs}ms; node_repl MCP transport remains open for follow-up calls`
+      `js tool timed out after ${timeoutMs}ms; node_repl MCP transport remains open for follow-up calls; consecutive_js_timeouts=${consecutiveTimeouts}. If lightweight browser calls still work but tab.playwright/tab.cua/fill/click/keyboard calls keep timing out, run js_reset and stop retrying the same page-level operation.`
     );
     this.name = "JsTimeoutError";
   }
 }
 
-async function withTimeoutMs(promise, timeoutMs, onTimeout) {
+async function withTimeoutMs(promise, timeoutMs, onTimeout, createTimeoutError) {
   if (!timeoutMs) return promise;
 
   let timer = null;
@@ -409,7 +410,7 @@ async function withTimeoutMs(promise, timeoutMs, onTimeout) {
           } catch (error) {
             log("timeout cleanup failed", error.stack || error.message);
           }
-          reject(new JsTimeoutError(timeoutMs));
+          reject(createTimeoutError ? createTimeoutError() : new JsTimeoutError(timeoutMs));
         }, timeoutMs);
         timer.unref?.();
       }),
@@ -499,18 +500,29 @@ async function callTool(name, args = {}) {
     const startedAt = Date.now();
     log("js call started", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
     try {
-      return await withTimeoutMs(runJs(args.code), timeoutMs, () => {
-        log("js timeout cleanup", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
-        if (RESET_ON_TIMEOUT) {
-          disposeContextResources(context, "timeout");
-          context = null;
-        }
-      });
+      const result = await withTimeoutMs(
+        runJs(args.code),
+        timeoutMs,
+        () => {
+          log("js timeout cleanup", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
+          if (RESET_ON_TIMEOUT) {
+            disposeContextResources(context, "timeout");
+            context = null;
+          }
+        },
+        () => new JsTimeoutError(timeoutMs, consecutiveJsTimeouts + 1)
+      );
+      consecutiveJsTimeouts = 0;
+      return result;
+    } catch (error) {
+      if (error instanceof JsTimeoutError) consecutiveJsTimeouts += 1;
+      throw error;
     } finally {
       log("js call finished", `duration_ms=${Date.now() - startedAt} ${summarizeJsArgs(args)}`);
     }
   }
   if (name === "js_reset") {
+    consecutiveJsTimeouts = 0;
     resetContext();
     return { content: [{ type: "text", text: "reset" }] };
   }

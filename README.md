@@ -26,6 +26,8 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   and per-call `timeout_ms`/`timeoutMs` fields.
 - Cleans up native browser sockets after a `js` timeout, so a timed-out browser
   command is less likely to poison follow-up tool calls in the same MCP process.
+- Adds skill guidance so agents stop retrying the same page-level browser
+  operation after repeated `tab.playwright` / `tab.cua` / input timeouts.
 - Gives each MCP process a unique Browser Use `session_id` and stable
   process-scoped `turn_id`, matching the isolation the official desktop runtime
   normally provides for browser-session state.
@@ -171,6 +173,11 @@ Chrome on `node_repl` and moving Browser Use to `browser_node_repl`. The patched
 Browser skill knows to search for `browser_node_repl js` when `node_repl/js` is
 not visible.
 
+The patched Chrome skill is deliberately stricter: Chrome tasks should use
+`node_repl`, not `browser_node_repl`. The latter exists only for Browser /
+in-app-browser compatibility and can lead a Chrome request down Browser-specific
+routing instructions.
+
 For direct Codex CLI usage, also add:
 
 ```bash
@@ -258,6 +265,13 @@ pipe connections and resets the JS context after a timeout; set
 `CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` only if you need to preserve in-memory JS
 state across timeouts. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if you
 explicitly want timeout errors to terminate the MCP process.
+
+The timeout error includes a `consecutive_js_timeouts` counter and recovery
+hint. If lightweight calls such as `browser.tabs.list()`, `tab.url()`, and
+`tab.title()` still work while `domSnapshot`, screenshot, click, fill, or
+keyboard calls keep timing out, treat it as a page-level browser bridge hang.
+Run `js_reset`, try one smaller operation, then stop and report the page-level
+blocker instead of looping on the same call.
 
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is

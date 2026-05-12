@@ -553,11 +553,18 @@ const BROWSER_SKILL_ROUTING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-skill-routes-iab-to-chrome";
 const BROWSER_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-node-repl-discovery";
+const BROWSER_SKILL_TIMEOUT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-timeout-recovery";
+const CHROME_SKILL_NODE_REPL_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: chrome-node-repl-discovery";
+const CHROME_SKILL_TIMEOUT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: chrome-timeout-recovery";
 
 function patchBrowserSkill(text) {
   if (
     text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
-    text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER)
+    text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER) &&
+    text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER)
   ) {
     return text;
   }
@@ -578,10 +585,13 @@ function patchBrowserSkill(text) {
 
 <!-- ${BROWSER_SKILL_ROUTING_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_NODE_REPL_PATCH_MARKER} -->
+<!-- ${BROWSER_SKILL_TIMEOUT_PATCH_MARKER} -->
 
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the normal \`iab\` Browser workflow. The local runtime maps \`iab\` to the Chromium-backed Codex Chrome Extension because Linux remote hosts do not have a Codex Desktop in-app browser. Do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
 
 For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
+
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
 
 `;
   return output.replace(bootstrapHeader, `${section}## Bootstrap`);
@@ -589,6 +599,8 @@ For Browser plugin tasks, the Linux compatibility MCP server may appear as \`bro
 
 function patchChromeSkill(text) {
   if (
+    text.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER) &&
+    text.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER) &&
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
     text.includes("final answer must include the Markdown image link")
   ) {
@@ -602,11 +614,35 @@ function patchChromeSkill(text) {
     ),
     ""
   );
+  output = output.replace(
+    new RegExp(
+      `\\r?\\n## Linux Chromium Node REPL Compatibility\\r?\\n\\r?\\n<!-- ${escapeRegExp(
+        CHROME_SKILL_NODE_REPL_PATCH_MARKER
+      )} -->[\\s\\S]*?(?=\\r?\\n## (Screenshot Output Compatibility|Tab Cleanup))`
+    ),
+    ""
+  );
+  output = output.replace(
+    new RegExp(
+      `\\r?\\n## Timeout Recovery Compatibility\\r?\\n\\r?\\n<!-- ${escapeRegExp(
+        CHROME_SKILL_TIMEOUT_PATCH_MARKER
+      )} -->[\\s\\S]*?(?=\\r?\\n## (Screenshot Output Compatibility|Tab Cleanup))`
+    ),
+    ""
+  );
   const tabCleanupHeader = /\r?\n## Tab Cleanup/;
   if (!tabCleanupHeader.test(output)) {
     throw new Error("Could not find patch point for Chrome skill screenshot output instructions");
   }
   const section = `
+## Linux Chromium Node REPL Compatibility
+
+<!-- ${CHROME_SKILL_NODE_REPL_PATCH_MARKER} -->
+
+On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, Chrome plugin tasks must use the Chrome plugin's \`node_repl\` MCP server. Search for \`node_repl js\` and call \`mcp__node_repl__js\`.
+
+Do not use \`browser_node_repl\` for Chrome plugin tasks. \`browser_node_repl\` is reserved for Browser / in-app browser compatibility and can cause Chrome tasks to follow Browser-specific routing instructions.
+
 ## Screenshot Output Compatibility
 
 <!-- ${SCREENSHOT_OUTPUT_PATCH_MARKER} -->
@@ -623,6 +659,12 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
 
 - The final answer must include the Markdown image link, for example \`![Google screenshot](/absolute/path/google-screenshot.png)\`. Do not only say that the screenshot is "shown above".
 - Do not reference \`attachment://...\` image URLs in the final response. Prior tool-output images are not exposed under those attachment URIs in this compatibility runtime.
+
+## Timeout Recovery Compatibility
+
+<!-- ${CHROME_SKILL_TIMEOUT_PATCH_MARKER} -->
+
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
 
 `;
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);
@@ -1109,6 +1151,7 @@ function patchStatusForRoot(root, paths) {
         browserClient.includes('case"extension":return"iab"'),
       browserSkillRoutesIabToChrome: browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER),
       browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
+      browserSkillTimeoutRecovery: browserSkill.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER),
       browserUsePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
     };
   }
@@ -1139,9 +1182,11 @@ function patchStatusForRoot(root, paths) {
       ),
     openWindowChromium:
       /commandPath\("chromium"\)[\s\S]*command:\s*linuxChromeCommand/.test(openWindow),
+    chromeSkillNodeReplDiscovery: chromeSkill.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER),
     chromeSkillScreenshotOutput:
       chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
       chromeSkill.includes("final answer must include the Markdown image link"),
+    chromeSkillTimeoutRecovery: chromeSkill.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER),
   };
 }
 
