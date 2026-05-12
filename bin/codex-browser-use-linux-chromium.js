@@ -304,6 +304,16 @@ function detectPluginRoots(args) {
       }
     }
   }
+
+  const stagedBundledRoot = path.join(args.codexHome, ".tmp", "bundled-marketplaces");
+  for (const marketplace of ["openai-bundled", "openai-bundled-beta"]) {
+    for (const pluginName of ["chrome", "browser-use"]) {
+      const candidate = path.join(stagedBundledRoot, marketplace, "plugins", pluginName);
+      if (fs.existsSync(path.join(candidate, "scripts", "browser-client.mjs"))) {
+        roots.add(candidate);
+      }
+    }
+  }
   return [...roots].sort();
 }
 
@@ -541,22 +551,40 @@ const SCREENSHOT_OUTPUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: screenshot-output-compatibility";
 const BROWSER_SKILL_ROUTING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-skill-routes-iab-to-chrome";
+const BROWSER_SKILL_NODE_REPL_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-node-repl-discovery";
 
 function patchBrowserSkill(text) {
-  if (text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER)) return text;
+  if (
+    text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
+    text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER)
+  ) {
+    return text;
+  }
+  let output = text.replace(
+    new RegExp(
+      `\\r?\\n## Linux Chromium Compatibility\\r?\\n\\r?\\n<!-- ${escapeRegExp(
+        BROWSER_SKILL_ROUTING_PATCH_MARKER
+      )} -->[\\s\\S]*?(?=\\r?\\n## Bootstrap)`
+    ),
+    ""
+  );
   const bootstrapHeader = /\r?\n## Bootstrap/;
-  if (!bootstrapHeader.test(text)) {
+  if (!bootstrapHeader.test(output)) {
     throw new Error("Could not find patch point for Browser skill Linux Chromium routing instructions");
   }
   const section = `
 ## Linux Chromium Compatibility
 
 <!-- ${BROWSER_SKILL_ROUTING_PATCH_MARKER} -->
+<!-- ${BROWSER_SKILL_NODE_REPL_PATCH_MARKER} -->
 
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the normal \`iab\` Browser workflow. The local runtime maps \`iab\` to the Chromium-backed Codex Chrome Extension because Linux remote hosts do not have a Codex Desktop in-app browser. Do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
 
+For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
+
 `;
-  return text.replace(bootstrapHeader, `${section}## Bootstrap`);
+  return output.replace(bootstrapHeader, `${section}## Bootstrap`);
 }
 
 function patchChromeSkill(text) {
@@ -622,7 +650,15 @@ function resolvePluginMcpConfigPath(root) {
   return path.join(root, relativePath);
 }
 
-function patchPluginMcpConfig(text, paths) {
+function pluginMcpServerName(kind) {
+  return kind === "chrome" ? "node_repl" : "browser_node_repl";
+}
+
+function pluginMcpLegacyServerName(kind) {
+  return kind === "chrome" ? "browser_node_repl" : "node_repl";
+}
+
+function patchPluginMcpConfig(text, paths, kind) {
   let config;
   try {
     config = JSON.parse(text);
@@ -631,22 +667,24 @@ function patchPluginMcpConfig(text, paths) {
   }
   const mcpServers =
     config?.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers : {};
-  const nodeRepl = mcpServers.node_repl;
+  const serverName = pluginMcpServerName(kind);
+  const legacyServerName = pluginMcpLegacyServerName(kind);
+  const nodeRepl = mcpServers[serverName];
   if (nodeRepl && typeof nodeRepl !== "object") {
-    throw new Error("plugin MCP config node_repl entry is not an object");
+    throw new Error(`plugin MCP config ${serverName} entry is not an object`);
   }
 
-  const nodePath = commandPath("node") || process.execPath;
+  const nextMcpServers = { ...mcpServers };
+  delete nextMcpServers[legacyServerName];
+  nextMcpServers[serverName] = {
+    ...(nodeRepl || {}),
+    command: commandPath("node") || process.execPath,
+    args: [paths.nodeReplMcp],
+  };
+
   const nextConfig = {
     ...config,
-    mcpServers: {
-      ...mcpServers,
-      node_repl: {
-        ...(nodeRepl || {}),
-        command: nodePath,
-        args: [paths.nodeReplMcp],
-      },
-    },
+    mcpServers: nextMcpServers,
   };
   return `${JSON.stringify(nextConfig, null, 2)}\n`;
 }
@@ -701,7 +739,7 @@ function planPluginRootPatch(root, paths) {
   }
   const mcpConfigPath = resolvePluginMcpConfigPath(root) || path.join(root, ".mcp.json");
   const mcpPatch = planGeneratedJsonPatch(mcpConfigPath, (text) =>
-    patchPluginMcpConfig(text, paths)
+    patchPluginMcpConfig(text, paths, kind)
   );
   if (mcpPatch) results.push(mcpPatch);
   return { root, kind, results };
@@ -1013,9 +1051,12 @@ function requireLinuxWrites(args) {
 }
 
 function pluginMcpNodeReplStatus(root, paths) {
+  const kind = pluginRootKind(root);
+  const serverName = pluginMcpServerName(kind);
   const mcpConfigPath = resolvePluginMcpConfigPath(root);
   const status = {
     path: mcpConfigPath,
+    serverName,
     exists: Boolean(mcpConfigPath && fs.existsSync(mcpConfigPath)),
     nodeReplExists: false,
     actualNodeReplPath: null,
@@ -1025,7 +1066,7 @@ function pluginMcpNodeReplStatus(root, paths) {
 
   try {
     const config = readJsonFile(mcpConfigPath);
-    const nodeRepl = config?.mcpServers?.node_repl;
+    const nodeRepl = config?.mcpServers?.[serverName];
     status.nodeReplExists = Boolean(nodeRepl);
     const firstArg = Array.isArray(nodeRepl?.args) ? nodeRepl.args[0] : null;
     status.actualNodeReplPath = typeof firstArg === "string" ? firstArg : null;
@@ -1067,6 +1108,7 @@ function patchStatusForRoot(root, paths) {
         browserClient.includes('extension:"iab"') &&
         browserClient.includes('case"extension":return"iab"'),
       browserSkillRoutesIabToChrome: browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER),
+      browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
       browserUsePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
     };
   }
@@ -1242,7 +1284,7 @@ function doctor(args) {
     console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.kind} ${root.root}`);
     if (root.pluginMcpNodeRepl.exists && root.pluginMcpNodeRepl.nodeReplExists) {
       console.log(
-        `  plugin mcp node_repl: ${
+        `  plugin mcp ${root.pluginMcpNodeRepl.serverName}: ${
           root.pluginMcpNodeRepl.pathMatches ? "ok" : "mismatch"
         } ${root.pluginMcpNodeRepl.path}`
       );

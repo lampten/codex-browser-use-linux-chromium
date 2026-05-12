@@ -32,8 +32,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
 - Patches locally cached Codex Browser Use / Chrome plugin scripts so they
   recognize Chromium on Linux.
 - Patches plugin-local `mcpServers` metadata for both Chrome and Browser Use,
-  so Codex CLI 0.130+ plugin caches expose `node_repl` from the selected plugin
-  version directory instead of depending on a global or stale MCP entry.
+  so Codex CLI 0.130+ plugin caches expose the selected plugin version's MCP
+  entry instead of depending on a global or stale MCP entry. Chrome keeps the
+  official `node_repl` name; Browser Use is renamed to `browser_node_repl` to
+  avoid Codex's duplicate plugin MCP server-name de-duplication.
 - On Linux, hard-routes the official `Browser` / `browser-use` `iab` backend
   to the Chromium-backed extension backend. Linux remote hosts do not have the
   Codex Desktop in-app browser, so `@browser` and frontend-testing skills need
@@ -105,13 +107,15 @@ node bin/codex-browser-use-linux-chromium.js doctor
   Use `--system-native-host` when Chromium already has a system manifest under
   `/etc/chromium/native-messaging-hosts` or Chrome has one under
   `/etc/opt/chrome/native-messaging-hosts`.
-- Patches discovered official Browser Use / Chrome plugin caches. Plugin
-  patching is planned transactionally per plugin root: if any required patch
-  point is missing, that plugin root is left untouched.
-- Updates or creates plugin-local `.mcp.json` `node_repl` entries pointing to
-  the installed runtime. The installer also adds `mcpServers` metadata to
-  Chrome and Browser Use plugin manifests when the official cache does not ship
-  it.
+- Patches discovered official Browser Use / Chrome plugin caches and Codex
+  0.130 staged bundled-marketplace plugin roots under
+  `~/.codex/.tmp/bundled-marketplaces/...`. Plugin patching is planned
+  transactionally per plugin root: if any required patch point is missing, that
+  plugin root is left untouched.
+- Updates or creates plugin-local `.mcp.json` entries pointing to the installed
+  runtime. Chrome plugin roots use `node_repl`; Browser Use plugin roots use
+  `browser_node_repl`. The installer also adds `mcpServers` metadata to Chrome
+  and Browser Use plugin manifests when the official cache does not ship it.
 - Enables `features.tool_search_always_defer_mcp_tools = true` in
   `~/.codex/config.toml` so Codex 0.130+ exposes plugin MCP tools such as
   `node_repl/js` through `tool_search`. Pass `--skip-feature-config` only if
@@ -158,6 +162,14 @@ tool_search_always_defer_mcp_tools = true
 Without it, `node_repl` can be registered as a direct MCP tool but absent from
 `tool_search`, which makes Chrome/Browser skills report that no JS tool is
 available even though `codex mcp list` shows the server.
+
+Codex 0.130 also de-duplicates plugin MCP servers by name. If both the Chrome
+and Browser Use plugin caches declare `node_repl`, the first loaded plugin can
+claim the name and the other plugin's JS tool may not be discoverable in a
+desktop remote conversation. This installer avoids that collision by keeping
+Chrome on `node_repl` and moving Browser Use to `browser_node_repl`. The patched
+Browser skill knows to search for `browser_node_repl js` when `node_repl/js` is
+not visible.
 
 For direct Codex CLI usage, also add:
 
@@ -224,7 +236,13 @@ Useful logs on the Linux host:
 
 If a fresh Codex Desktop conversation cannot see `mcp__node_repl__js`, search
 `logs_2.sqlite` for `RefreshMcpServers` and verify the exact `node_repl.command`
-exists on the Linux host.
+exists on the Linux host. Also search the logs for `skipping duplicate plugin
+MCP server name`: if Chrome and Browser Use both declare `node_repl`, reinstall
+this compatibility layer so Browser Use is moved to `browser_node_repl`, then
+restart `codex app-server`. On Codex 0.130 remote hosts, verify both
+`~/.codex/plugins/cache/...` and
+`~/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/...`; the staged
+bundled-marketplace copy is what some Desktop remote turns load.
 
 If `mcp__node_repl__js` appears to hang, check for old
 `codex-node-repl-mcp.js` processes and open connections in

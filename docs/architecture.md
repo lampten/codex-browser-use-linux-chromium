@@ -49,6 +49,25 @@ through `tool_search` in new turns. `doctor` reports the flag separately from
 native-host and plugin-cache status so a missing JS tool is not misdiagnosed as
 a Chromium path problem.
 
+Codex 0.130 also de-duplicates plugin MCP server names while loading plugin
+metadata. The official Chrome and Browser Use caches can both point at a server
+called `node_repl`; when that happens, the first loaded plugin owns the name and
+the later plugin is skipped. On remote desktop clients this can make `@Chrome`
+load the Chrome skill while still failing to discover `node_repl/js`.
+
+This compatibility layer keeps the Chrome plugin on the official `node_repl`
+server name and rewrites the Browser Use plugin's local MCP entry to
+`browser_node_repl`. The Browser skill patch documents that fallback name. The
+two plugin surfaces still point to the same Linux runtime, but they no longer
+collide in Codex's plugin MCP registry.
+
+There are two plugin roots to consider on Codex 0.130 remote hosts. The normal
+installed cache lives under `~/.codex/plugins/cache/...`, while Desktop remote
+turns may also load a staged bundled-marketplace copy under
+`~/.codex/.tmp/bundled-marketplaces/<marketplace>/plugins/...`. Both copies
+need the same MCP metadata and skill patches; otherwise a restarted app-server
+can still build a turn from the unpatched staged copy.
+
 ## Browser vs Chrome Routing
 
 Codex currently ships two related browser plugin surfaces:
