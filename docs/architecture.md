@@ -126,7 +126,7 @@ conversations share browser-session state. Changing `turn_id` between adjacent
 look detached to the next call.
 
 The `js` tool also has a process-level timeout controlled by
-`CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 120000 ms. When a JavaScript
+`CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 100000 ms. When a JavaScript
 call times out, the MCP server returns an error but keeps its stdio transport
 open so the same Codex turn can still run recovery calls such as `js_reset`.
 After a timeout, the compatibility runtime destroys native browser pipe sockets
@@ -136,11 +136,20 @@ Set `CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` to preserve the old behavior, or
 `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` to restore exit-on-timeout behavior.
 
 Timeout errors include a `consecutive_js_timeouts` counter and a short recovery
-hint. The patched Browser and Chrome skills also tell agents to stop retrying
-the same page-level operation after repeated `tab.playwright`, `tab.cua`, fill,
-click, or keyboard timeouts when lightweight tab listing and URL/title reads
-still work. That pattern is a page-level bridge hang, not an MCP discovery
-failure.
+hint. Screenshots and `domSnapshot()` remain normal supported Browser/Chrome
+features on Linux Chromium. The patched Browser and Chrome skills tell agents
+to keep those calls single-purpose, reset after stale-pipe errors, and retry the
+requested evidence from a fresh tab object instead of silently avoiding the
+feature. Repeated `tab.playwright`, `tab.cua`, fill, click, or keyboard
+timeouts while lightweight tab listing and URL/title reads still work are a
+page-level bridge hang, not an MCP discovery failure.
+
+The installer also patches the Browser client CDP wrapper so `timeoutMs` is
+enforced in JavaScript with a local `Promise.race`, not only passed through to
+the extension. This matters when Chromium or the extension stops honoring the
+requested timeout for page-level CDP calls such as `Page.captureScreenshot`.
+Those failures now return as bounded browser errors that can be reset and
+retried instead of waiting for the outer MCP transport to close.
 
 The native host bridge also serializes writes to Chromium stdout and waits for
 Node's `drain` event when the Chrome native-messaging pipe reports backpressure.

@@ -28,7 +28,7 @@ const SESSION_ID =
   realProcess.env.CODEX_NODE_REPL_SESSION_ID ||
   `node-repl-mcp-${os.hostname()}-${realProcess.pid}-${randomUUID()}`;
 const TURN_ID = realProcess.env.CODEX_NODE_REPL_TURN_ID || `${SESSION_ID}-turn`;
-const JS_TIMEOUT_MS = parseNonNegativeInt(realProcess.env.CODEX_NODE_REPL_JS_TIMEOUT_MS, 120000);
+const JS_TIMEOUT_MS = parseNonNegativeInt(realProcess.env.CODEX_NODE_REPL_JS_TIMEOUT_MS, 100000);
 const EXIT_ON_TIMEOUT = /^(1|true|yes)$/i.test(
   realProcess.env.CODEX_NODE_REPL_EXIT_ON_TIMEOUT || ""
 );

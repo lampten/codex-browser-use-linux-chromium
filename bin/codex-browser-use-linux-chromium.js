@@ -407,7 +407,110 @@ function patchBrowserClient(text) {
   ) {
     throw new Error("Native pipe fallback patch produced malformed UnavailableMessage access");
   }
+  output = patchBrowserClientPageCommandTimeouts(output);
+  output = patchBrowserClientCdpCallTimeouts(output);
   return output;
+}
+
+const BROWSER_CLIENT_PAGE_TIMEOUT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-page-command-timeouts";
+
+function replaceRegexRequired(text, pattern, replacement, label) {
+  if (typeof replacement === "string" && text.includes(replacement)) return text;
+  const output = text.replace(pattern, replacement);
+  if (output === text) throw new Error(`Could not find patch point for ${label}`);
+  return output;
+}
+
+function patchBrowserClientPageCommandTimeouts(text) {
+  if (text.includes(BROWSER_CLIENT_PAGE_TIMEOUT_PATCH_MARKER)) return text;
+
+  let output = text;
+  output = replaceRegexRequired(
+    output,
+    /function re\(t\)\{let e=typeof t\.timeout_ms=="number"\?t\.timeout_ms:3e3;return Math\.min\(Math\.max\(0,e\),t\.max\|\|3e3\)\}/,
+    'function re(t){let e=typeof t.timeout_ms=="number"?t.timeout_ms:typeof t.client_timeout_ms=="number"?t.client_timeout_ms:3e3;return Math.min(Math.max(0,e),t.max||3e3)}',
+    "Browser client client_timeout_ms fallback"
+  );
+  output = replaceRegexRequired(
+    output,
+    /e\.cdp\.call\(t,"Runtime\.evaluate",\{expression:"window\.devicePixelRatio",returnByValue:!0\}\)/,
+    'e.cdp.call(t,"Runtime.evaluate",{expression:"window.devicePixelRatio",returnByValue:!0},{timeoutMs:3e3})',
+    "Browser client device pixel ratio CDP timeout"
+  );
+  output = output.replace(
+    /e\.cdp\.call\(r,"Page\.getLayoutMetrics"\)/g,
+    'e.cdp.call(r,"Page.getLayoutMetrics",void 0,{timeoutMs:re({...t,timeout_ms:t.timeout_ms??1e4,max:3e4})})'
+  );
+  output = replaceRegexRequired(
+    output,
+    /e\.cdp\.call\(r,"Page\.captureScreenshot",n\)/,
+    'e.cdp.call(r,"Page.captureScreenshot",n,{timeoutMs:re({...t,timeout_ms:t.timeout_ms??1e4,max:3e4})})',
+    "Browser client Playwright screenshot CDP timeout"
+  );
+  output = replaceRegexRequired(
+    output,
+    /e\.cdp\.call\(r,"Page\.captureScreenshot",\{format:"jpeg",quality:80,clip:i\}\)/,
+    'e.cdp.call(r,"Page.captureScreenshot",{format:"jpeg",quality:80,clip:i},{timeoutMs:1e4})',
+    "Browser client CUA screenshot CDP timeout"
+  );
+  output = replaceRegexRequired(
+    output,
+    /async screenshot\(e=\{\}\)\{let r=\{browser_id:this\.#e,tab_id:this\.#t,fullPage:e\.fullPage\};([\s\S]*?)let n=await this\.#r\.send\(\{command:([A-Za-z_$][A-Za-z0-9_$]*)\.create\(r\)\}\);return new ot\(n\.data\)\}/,
+    (_match, body, commandName) =>
+      `async screenshot(e={}){let r={browser_id:this.#e,tab_id:this.#t,fullPage:e.fullPage};${body}let c=e.timeoutMs??1e4;r.timeout_ms=c;let n=await this.#r.send({command:${commandName}.create(r),timeoutMs:c});return new ot(n.data)}`,
+    "Browser client screenshot timeout option"
+  );
+  output = replaceRegexRequired(
+    output,
+    /async domSnapshot\(\)\{return\(await this\.#r\.send\(\{command:([A-Za-z_$][A-Za-z0-9_$]*)\.create\(\{browser_id:this\.#e,tab_id:this\.#t\}\)\}\)\)\.dom_snapshot\}/,
+    (_match, commandName) =>
+      `async domSnapshot(e={}){let r=e.timeoutMs??1e4;return(await this.#r.send({command:${commandName}.create({browser_id:this.#e,tab_id:this.#t,timeout_ms:r}),timeoutMs:r})).dom_snapshot}`,
+    "Browser client domSnapshot timeout option"
+  );
+  output = replaceRegexRequired(
+    output,
+    /(cropHeight:l\.number\(\)\.optional\(\))\}\),([A-Za-z_$][A-Za-z0-9_$]*)=l\.object\(\{data:l\.string\(\)\}\),([A-Za-z_$][A-Za-z0-9_$]*)="playwright_screenshot"/,
+    '$1,timeout_ms:l.number().optional()}),$2=l.object({data:l.string()}),$3="playwright_screenshot"',
+    "Browser client screenshot timeout schema"
+  );
+  output = replaceRegexRequired(
+    output,
+    /(var [A-Za-z_$][A-Za-z0-9_$]*=l\.object\(\{browser_id:l\.string\(\),tab_id:l\.string\(\))\}\),([A-Za-z_$][A-Za-z0-9_$]*=l\.object\(\{dom_snapshot:l\.string\(\)\}\),[A-Za-z_$][A-Za-z0-9_$]*="playwright_dom_snapshot")/,
+    "$1,timeout_ms:l.number().optional()}),$2",
+    "Browser client domSnapshot timeout schema"
+  );
+  output = replaceRegexRequired(
+    output,
+    /mode:"ai",track:"browser-client-dom-snapshot"\}\)\.full:""\}\);return\{dom_snapshot:/,
+    'mode:"ai",track:"browser-client-dom-snapshot"}).full:""},{timeoutMs:re({...t,timeout_ms:t.timeout_ms??1e4,max:3e4})});return{dom_snapshot:',
+    "Browser client domSnapshot page-evaluation timeout"
+  );
+  output = replaceRegexRequired(
+    output,
+    /async evaluateOnPlaywrightPage\(e,r,n=\{\}\)\{let o=r\.toString\(\),i=([A-Za-z_$][A-Za-z0-9_$]*)\(n\.arg\);return await this\.evaluateWithPlaywrightInjected\(e,`\(async \(\) => \{\n          const injected = window\.\$\{t\.injectedConstant\};\n          return await \(\$\{o\}\)\(injected, \$\{i\}\);\n        \}\)\(\)`\)\}/,
+    (_match, stringifyArgName) =>
+      `async evaluateOnPlaywrightPage(e,r,n={}){let o=r.toString(),i=${stringifyArgName}(n.arg);return await this.evaluateWithPlaywrightInjected(e,\`(async () => {\n          const injected = window.\${t.injectedConstant};\n          return await (\${o})(injected, \${i});\n        })()\`,{timeoutMs:n.timeoutMs})}`,
+    "Browser client evaluateOnPlaywrightPage timeout forwarding"
+  );
+
+  return `/* ${BROWSER_CLIENT_PAGE_TIMEOUT_PATCH_MARKER} */\n${output}`;
+}
+
+const BROWSER_CLIENT_CDP_CALL_TIMEOUT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-cdp-call-timeouts";
+
+function patchBrowserClientCdpCallTimeouts(text) {
+  if (text.includes(BROWSER_CLIENT_CDP_CALL_TIMEOUT_PATCH_MARKER)) return text;
+
+  const output = replaceRegexRequired(
+    text,
+    /async call\(r,n,o,i=\{\}\)\{let s=Number\(r\);if\(!Number\.isFinite\(s\)\)throw new Error\("callCdp requires numeric tab_id"\);await this\.ensureAttachedTab\(s\);try\{return await this\.api\.executeCdp\(\{target:\{tabId:s\},method:n,commandParams:o\?\?\{\},timeoutMs:i\.timeoutMs\}\)\}catch\(a\)\{if\(a==="Debugger unattached"\|\|typeof a=="string"&&a\.includes\("Debugger is not attached"\)\)return this\.forgetAttachedTab\(s\),this\.call\(r,n,o,i\);throw a\}\}/,
+    'async call(r,n,o,i={}){let s=Number(r);if(!Number.isFinite(s))throw new Error("callCdp requires numeric tab_id");await this.ensureAttachedTab(s);try{let a=this.api.executeCdp({target:{tabId:s},method:n,commandParams:o??{},timeoutMs:i.timeoutMs});if(typeof i.timeoutMs=="number"&&i.timeoutMs>0){let u;try{return await Promise.race([a,new Promise((c,d)=>{u=setTimeout(()=>d(new Error(`Timed out after ${i.timeoutMs}ms waiting for CDP command ${n}.`)),i.timeoutMs)})])}finally{clearTimeout(u)}}return await a}catch(a){if(a==="Debugger unattached"||typeof a=="string"&&a.includes("Debugger is not attached"))return this.forgetAttachedTab(s),this.call(r,n,o,i);throw a}}',
+    "Browser client CDP call Promise timeout"
+  );
+
+  return `/* ${BROWSER_CLIENT_CDP_CALL_TIMEOUT_PATCH_MARKER} */\n${output}`;
 }
 
 const BROWSER_USE_IAB_CHROME_ROUTING_MARKER =
@@ -569,7 +672,8 @@ function patchBrowserSkill(text) {
     text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER) &&
-    text.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER)
+    text.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
+    text.includes("do not silently replace a requested screenshot with text-only output")
   ) {
     return text;
   }
@@ -597,13 +701,15 @@ On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep usin
 
 For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
 
-Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. Prefer \`tab.dom_cua.get_visible_dom()\`, \`tab.url()\`, \`tab.title()\`, or a targeted locator/evaluate check over broad \`tab.playwright.domSnapshot()\` immediately after an interaction.
+Screenshots and \`domSnapshot()\` are supported Browser capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
+
+Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, a targeted locator/evaluate check is usually cheaper than \`tab.playwright.domSnapshot()\`, but the full snapshot remains valid when it is the right evidence.
 
 For page extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
 If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Browser runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, reacquire the tab, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
   return output.replace(bootstrapHeader, `${section}## Bootstrap`);
@@ -615,7 +721,8 @@ function patchChromeSkill(text) {
     text.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER) &&
     text.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
-    text.includes("final answer must include the Markdown image link")
+    text.includes("final answer must include the Markdown image link") &&
+    text.includes("do not silently replace a requested screenshot with text-only output")
   ) {
     return text;
   }
@@ -678,13 +785,15 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
 <!-- ${CHROME_SKILL_TIMEOUT_PATCH_MARKER} -->
 <!-- ${CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER} -->
 
-Keep each Chromium bridge call short and single-purpose. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. Prefer \`tab.url()\`, \`tab.title()\`, \`tab.dom_cua.get_visible_dom()\`, or targeted locator/evaluate checks over broad \`tab.playwright.domSnapshot()\` immediately after an interaction.
+Screenshots and \`domSnapshot()\` are supported Chrome capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
+
+Keep each Chromium bridge call short and single-purpose. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, a targeted locator/evaluate check is usually cheaper than \`tab.playwright.domSnapshot()\`, but the full snapshot remains valid when it is the right evidence.
 
 For extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
 If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Chrome runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, reacquire the tab, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);

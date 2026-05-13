@@ -24,6 +24,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   deliverables as visible file artifacts.
 - Accepts the official Node REPL `js` call shape, including optional `title`
   and per-call `timeout_ms`/`timeoutMs` fields.
+- Adds Browser client CDP call timeouts around page-level operations such as
+  screenshot capture and DOM snapshots, so Chromium-side hangs return a
+  recoverable error instead of stalling the MCP call until the outer tool
+  transport closes.
 - Cleans up native browser sockets after a `js` timeout, so a timed-out browser
   command is less likely to poison follow-up tool calls in the same MCP process.
 - Restarts the native host bridge when a client disconnects with an in-flight
@@ -258,7 +262,7 @@ If `mcp__node_repl__js` appears to hang, check for old
 `codex-node-repl-mcp.js` processes and open connections in
 `/tmp/codex-native-host-bridge.log`. Each MCP process should log a distinct
 `session_id` and a stable `turn_id` in `/tmp/codex-node-repl-mcp.log`. The
-JavaScript tool has a default 120 second timeout; override it with
+JavaScript tool has a default 100 second timeout; override it with
 `CODEX_NODE_REPL_JS_TIMEOUT_MS=0` to disable the timeout or another millisecond
 value to tune it. The `js` tool also accepts per-call `timeout_ms`/`timeoutMs`
 values, matching the official runtime's call shape. A timeout returns an MCP
@@ -270,17 +274,22 @@ state across timeouts. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if you
 explicitly want timeout errors to terminate the MCP process.
 
 The timeout error includes a `consecutive_js_timeouts` counter and recovery
-hint. If lightweight calls such as `browser.tabs.list()`, `tab.url()`, and
-`tab.title()` still work while `domSnapshot`, screenshot, click, fill, or
-keyboard calls keep timing out, treat it as a page-level browser bridge hang.
-Run `js_reset`, try one smaller operation, then stop and report the page-level
-blocker instead of looping on the same call.
+hint. `domSnapshot()` and screenshot capture are normal supported Browser Use
+features on Linux Chromium; the compatibility layer should not steer agents to
+silently avoid them. If lightweight calls such as `browser.tabs.list()`,
+`tab.url()`, and `tab.title()` still work while `domSnapshot`, screenshot,
+click, fill, or keyboard calls keep timing out, treat it as a page-level
+browser bridge hang. Run `js_reset`, re-bootstrap, reacquire the tab, and retry
+the requested evidence in a fresh single-purpose call. If it still fails,
+report that page-level blocker instead of claiming the screenshot or DOM feature
+is unavailable.
 
 On Linux Chromium, keep browser bridge calls short and single-purpose. Do not
 combine click/fill/keyboard/navigation with `domSnapshot()`, screenshots, dev
 logs, or per-element extraction loops in one `js` call. Run the interaction,
-then verify in a fresh follow-up call with `tab.url()`, `tab.title()`,
-`tab.dom_cua.get_visible_dom()`, or a compact targeted `evaluate` result. If a
+then verify in a fresh follow-up call. Use screenshots for visual evidence and
+`domSnapshot()` when a full accessibility snapshot is the right evidence; use a
+compact targeted `evaluate` only when the task does not need the full tree. If a
 call fails with `native pipe is closed` or `Detached while handling command`,
 the REPL resets its stale browser context by default; run `js_reset`,
 re-bootstrap, and reacquire the tab before retrying.
