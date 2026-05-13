@@ -409,6 +409,7 @@ function patchBrowserClient(text) {
   }
   output = patchBrowserClientPageCommandTimeouts(output);
   output = patchBrowserClientCdpCallTimeouts(output);
+  output = patchBrowserClientFastVisibleScreenshots(output);
   return output;
 }
 
@@ -511,6 +512,33 @@ function patchBrowserClientCdpCallTimeouts(text) {
   );
 
   return `/* ${BROWSER_CLIENT_CDP_CALL_TIMEOUT_PATCH_MARKER} */\n${output}`;
+}
+
+const BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-fast-visible-screenshots";
+
+function patchBrowserClientFastVisibleScreenshots(text) {
+  if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
+
+  let output = text;
+  output = output.replace(
+    /let c=e\.timeoutMs\?\?1e4;r\.timeout_ms=c;/g,
+    "let c=e.timeoutMs??2e4;r.timeout_ms=c;"
+  );
+  output = replaceRegexRequired(
+    output,
+    /var ([A-Za-z_$][A-Za-z0-9_$]*)=x\("cua_get_visible_screenshot",async\(t,e\)=>\{let r=([A-Za-z_$][A-Za-z0-9_$]*)\(t\.tab_id\),\{cssVisualViewport:([A-Za-z_$][A-Za-z0-9_$]*)\}=await e\.cdp\.call\(r,"Page\.getLayoutMetrics",void 0,\{timeoutMs:re\(\{\.\.\.t,timeout_ms:t\.timeout_ms\?\?1e4,max:3e4\}\)\}\),([A-Za-z_$][A-Za-z0-9_$]*)=await ([A-Za-z_$][A-Za-z0-9_$]*)\(r,e\),([A-Za-z_$][A-Za-z0-9_$]*)=\{x:\3\.pageX,y:\3\.pageY,width:\3\.clientWidth,height:\3\.clientHeight,scale:\4\},([A-Za-z_$][A-Za-z0-9_$]*)=await e\.cdp\.call\(r,"Page\.captureScreenshot",\{format:"jpeg",quality:80,clip:\6\},\{timeoutMs:1e4\}\);/,
+    'var $1=x("cua_get_visible_screenshot",async(t,e)=>{let r=$2(t.tab_id),$7=await e.cdp.call(r,"Page.captureScreenshot",{format:"jpeg",quality:80,optimizeForSpeed:!0},{timeoutMs:re({...t,timeout_ms:t.timeout_ms??2e4,max:3e4})});',
+    "Browser client CUA visible screenshot fast path"
+  );
+  output = replaceRegexRequired(
+    output,
+    /else\{let\{cssVisualViewport:([A-Za-z_$][A-Za-z0-9_$]*)\}=await e\.cdp\.call\(r,"Page\.getLayoutMetrics",void 0,\{timeoutMs:re\(\{\.\.\.t,timeout_ms:t\.timeout_ms\?\?1e4,max:3e4\}\)\}\);n\.clip=\{x:\1\.pageX,y:\1\.pageY,width:\1\.clientWidth,height:\1\.clientHeight,scale:i\}\}let ([A-Za-z_$][A-Za-z0-9_$]*)=await e\.cdp\.call\(r,"Page\.captureScreenshot",n,\{timeoutMs:re\(\{\.\.\.t,timeout_ms:t\.timeout_ms\?\?1e4,max:3e4\}\)\}\);/,
+    'else n.optimizeForSpeed=!0;let $2=await e.cdp.call(r,"Page.captureScreenshot",n,{timeoutMs:re({...t,timeout_ms:t.timeout_ms??2e4,max:3e4})});',
+    "Browser client Playwright visible screenshot fast path"
+  );
+
+  return `/* ${BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
 }
 
 const BROWSER_USE_IAB_CHROME_ROUTING_MARKER =

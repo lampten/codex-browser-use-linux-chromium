@@ -28,6 +28,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   screenshot capture and DOM snapshots, so Chromium-side hangs return a
   recoverable error instead of stalling the MCP call until the outer tool
   transport closes.
+- On Linux Chromium, uses a faster visible-viewport screenshot path that lets
+  Chromium capture the current viewport directly instead of first computing a
+  layout clip rectangle. Screenshot capture remains a supported first-class
+  operation.
 - Cleans up native browser sockets after a `js` timeout, so a timed-out browser
   command is less likely to poison follow-up tool calls in the same MCP process.
 - Restarts the native host bridge when a client disconnects with an in-flight
@@ -290,9 +294,10 @@ logs, or per-element extraction loops in one `js` call. Run the interaction,
 then verify in a fresh follow-up call. Use screenshots for visual evidence and
 `domSnapshot()` when a full accessibility snapshot is the right evidence; use a
 compact targeted `evaluate` only when the task does not need the full tree. If a
-call fails with `native pipe is closed` or `Detached while handling command`,
-the REPL resets its stale browser context by default; run `js_reset`,
-re-bootstrap, and reacquire the tab before retrying.
+call fails with `native pipe is closed`, `Detached while handling command`, or
+`Timed out after ... waiting for CDP command`, the REPL resets its stale browser
+context by default; run `js_reset`, re-bootstrap, and reacquire the tab before
+retrying.
 
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is

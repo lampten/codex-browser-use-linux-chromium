@@ -151,6 +151,14 @@ requested timeout for page-level CDP calls such as `Page.captureScreenshot`.
 Those failures now return as bounded browser errors that can be reset and
 retried instead of waiting for the outer MCP transport to close.
 
+For visible screenshots, the installer also patches the Linux Chromium client
+path to call `Page.captureScreenshot` for the current viewport directly. The
+official client normally asks `Page.getLayoutMetrics` for `cssVisualViewport`
+and then captures a clipped rectangle. That is valid, but on some Raspberry Pi
+or server Chromium sessions the clipped path can hang even when the page DOM is
+responsive. The Linux patch keeps screenshot support enabled while avoiding
+that slower path for normal viewport screenshots.
+
 The native host bridge also serializes writes to Chromium stdout and waits for
 Node's `drain` event when the Chrome native-messaging pipe reports backpressure.
 This is important for screenshot-heavy or retry-heavy browser tasks: without

@@ -506,7 +506,7 @@ function errorMessage(error) {
 
 function isBrowserBridgeStaleError(error) {
   const message = error && error.message ? error.message : String(error);
-  return /native pipe is closed|native pipe closed before response|Detached while handling command/i.test(
+  return /native pipe is closed|native pipe closed before response|Detached while handling command|Timed out after \d+ms waiting for CDP command/i.test(
     message
   );
 }
