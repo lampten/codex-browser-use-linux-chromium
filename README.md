@@ -276,6 +276,15 @@ keyboard calls keep timing out, treat it as a page-level browser bridge hang.
 Run `js_reset`, try one smaller operation, then stop and report the page-level
 blocker instead of looping on the same call.
 
+On Linux Chromium, keep browser bridge calls short and single-purpose. Do not
+combine click/fill/keyboard/navigation with `domSnapshot()`, screenshots, dev
+logs, or per-element extraction loops in one `js` call. Run the interaction,
+then verify in a fresh follow-up call with `tab.url()`, `tab.title()`,
+`tab.dom_cua.get_visible_dom()`, or a compact targeted `evaluate` result. If a
+call fails with `native pipe is closed` or `Detached while handling command`,
+the REPL resets its stale browser context by default; run `js_reset`,
+re-bootstrap, and reacquire the tab before retrying.
+
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is
 reading them. This version serializes native-host stdout writes and waits for

@@ -555,16 +555,21 @@ const BROWSER_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-node-repl-discovery";
 const BROWSER_SKILL_TIMEOUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-timeout-recovery";
+const BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-command-scoping";
 const CHROME_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-node-repl-discovery";
 const CHROME_SKILL_TIMEOUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-timeout-recovery";
+const CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: chrome-command-scoping";
 
 function patchBrowserSkill(text) {
   if (
     text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER) &&
-    text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER)
+    text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER) &&
+    text.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER)
   ) {
     return text;
   }
@@ -586,10 +591,17 @@ function patchBrowserSkill(text) {
 <!-- ${BROWSER_SKILL_ROUTING_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_NODE_REPL_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_TIMEOUT_PATCH_MARKER} -->
+<!-- ${BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER} -->
 
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the normal \`iab\` Browser workflow. The local runtime maps \`iab\` to the Chromium-backed Codex Chrome Extension because Linux remote hosts do not have a Codex Desktop in-app browser. Do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
 
 For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
+
+Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. Prefer \`tab.dom_cua.get_visible_dom()\`, \`tab.url()\`, \`tab.title()\`, or a targeted locator/evaluate check over broad \`tab.playwright.domSnapshot()\` immediately after an interaction.
+
+For page extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
+
+If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Browser runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
 
 If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
 
@@ -601,6 +613,7 @@ function patchChromeSkill(text) {
   if (
     text.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER) &&
     text.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER) &&
+    text.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
     text.includes("final answer must include the Markdown image link")
   ) {
@@ -663,6 +676,13 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
 ## Timeout Recovery Compatibility
 
 <!-- ${CHROME_SKILL_TIMEOUT_PATCH_MARKER} -->
+<!-- ${CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER} -->
+
+Keep each Chromium bridge call short and single-purpose. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. Prefer \`tab.url()\`, \`tab.title()\`, \`tab.dom_cua.get_visible_dom()\`, or targeted locator/evaluate checks over broad \`tab.playwright.domSnapshot()\` immediately after an interaction.
+
+For extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
+
+If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Chrome runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
 
 If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, try at most one smaller follow-up call, then stop and report the page-level blocker instead of repeatedly retrying the same operation.
 
@@ -1152,6 +1172,7 @@ function patchStatusForRoot(root, paths) {
       browserSkillRoutesIabToChrome: browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER),
       browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
       browserSkillTimeoutRecovery: browserSkill.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER),
+      browserSkillCommandScoping: browserSkill.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER),
       browserUsePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
     };
   }
@@ -1187,6 +1208,7 @@ function patchStatusForRoot(root, paths) {
       chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
       chromeSkill.includes("final answer must include the Markdown image link"),
     chromeSkillTimeoutRecovery: chromeSkill.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER),
+    chromeSkillCommandScoping: chromeSkill.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER),
   };
 }
 

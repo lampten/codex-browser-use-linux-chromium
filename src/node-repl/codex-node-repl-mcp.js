@@ -35,6 +35,9 @@ const EXIT_ON_TIMEOUT = /^(1|true|yes)$/i.test(
 const RESET_ON_TIMEOUT = !/^(0|false|no)$/i.test(
   realProcess.env.CODEX_NODE_REPL_RESET_ON_TIMEOUT || ""
 );
+const RESET_ON_BROWSER_BRIDGE_ERROR = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_NODE_REPL_RESET_ON_BROWSER_BRIDGE_ERROR || ""
+);
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
@@ -489,9 +492,23 @@ function sendError(id, error) {
     id,
     error: {
       code: -32000,
-      message: error && error.message ? error.message : String(error),
+      message: errorMessage(error),
     },
   });
+}
+
+function errorMessage(error) {
+  const message = error && error.message ? error.message : String(error);
+  if (!isBrowserBridgeStaleError(error)) return message;
+  if (/js_reset|re-bootstrap/i.test(message)) return message;
+  return `${message}. Browser bridge state was reset; run js_reset, re-bootstrap the runtime, and reacquire the tab before retrying.`;
+}
+
+function isBrowserBridgeStaleError(error) {
+  const message = error && error.message ? error.message : String(error);
+  return /native pipe is closed|native pipe closed before response|Detached while handling command/i.test(
+    message
+  );
 }
 
 async function callTool(name, args = {}) {
@@ -516,6 +533,11 @@ async function callTool(name, args = {}) {
       return result;
     } catch (error) {
       if (error instanceof JsTimeoutError) consecutiveJsTimeouts += 1;
+      else if (RESET_ON_BROWSER_BRIDGE_ERROR && isBrowserBridgeStaleError(error)) {
+        log("browser bridge error cleanup", error.message || String(error));
+        disposeContextResources(context, "browser-bridge-error");
+        context = null;
+      }
       throw error;
     } finally {
       log("js call finished", `duration_ms=${Date.now() - startedAt} ${summarizeJsArgs(args)}`);
