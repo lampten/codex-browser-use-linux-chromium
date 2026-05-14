@@ -49,11 +49,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   entry instead of depending on a global or stale MCP entry. Chrome keeps the
   official `node_repl` name; Browser Use is renamed to `browser_node_repl` to
   avoid Codex's duplicate plugin MCP server-name de-duplication.
-- On Linux, hard-routes the official `Browser` / `browser-use` `iab` backend
-  to the Chromium-backed extension backend. Linux remote hosts do not have the
-  Codex Desktop in-app browser, so `@browser` and frontend-testing skills need
-  this compatibility alias to use Chromium instead of failing before browser
-  setup.
+- On Linux, patches the official `Browser` / `browser-use` skill to keep the
+  `@browser` entrypoint but select the Chromium-backed `extension` backend.
+  Linux remote hosts do not have the Codex Desktop `iab` browser, and treating
+  the extension as `iab` is not equivalent for screenshot-heavy flows.
 - Optionally installs macOS Desktop remote path shims under `/Applications/...`
   on the Linux host. This is needed when Codex Desktop on macOS remotely
   connects to the Linux host and sends its own `node_repl` path through
@@ -283,8 +282,10 @@ features on Linux Chromium; the compatibility layer should not steer agents to
 silently avoid them. If lightweight calls such as `browser.tabs.list()`,
 `tab.url()`, and `tab.title()` still work while `domSnapshot`, screenshot,
 click, fill, or keyboard calls keep timing out, treat it as a page-level
-browser bridge hang. Run `js_reset`, re-bootstrap, reacquire the tab, and retry
-the requested evidence in a fresh single-purpose call. If it still fails,
+browser bridge hang. Run `js_reset`, re-bootstrap, create a new tab, navigate to
+the target URL again, and retry the requested evidence in a fresh single-purpose
+call. Do not recover by finding an existing tab with the same URL after a bridge
+reset; that tab may still be tied to an orphaned CDP command. If it still fails,
 report that page-level blocker instead of claiming the screenshot or DOM feature
 is unavailable.
 
@@ -296,8 +297,8 @@ then verify in a fresh follow-up call. Use screenshots for visual evidence and
 compact targeted `evaluate` only when the task does not need the full tree. If a
 call fails with `native pipe is closed`, `Detached while handling command`, or
 `Timed out after ... waiting for CDP command`, the REPL resets its stale browser
-context by default; run `js_reset`, re-bootstrap, and reacquire the tab before
-retrying.
+context by default; run `js_reset`, re-bootstrap, create a new tab, and navigate
+to the target URL again before retrying.
 
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is

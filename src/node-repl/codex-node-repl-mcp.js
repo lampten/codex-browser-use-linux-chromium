@@ -501,7 +501,7 @@ function errorMessage(error) {
   const message = error && error.message ? error.message : String(error);
   if (!isBrowserBridgeStaleError(error)) return message;
   if (/js_reset|re-bootstrap/i.test(message)) return message;
-  return `${message}. Browser bridge state was reset; run js_reset, re-bootstrap the runtime, and reacquire the tab before retrying.`;
+  return `${message}. Browser bridge state was reset; run js_reset, re-bootstrap the runtime, create a new tab, and navigate to the target URL again before retrying. Do not reuse an existing tab with the same URL after this error.`;
 }
 
 function isBrowserBridgeStaleError(error) {

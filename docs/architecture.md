@@ -83,10 +83,16 @@ Codex currently ships two related browser plugin surfaces:
   backend named `iab`.
 
 On a Linux remote host there is no Codex Desktop app and therefore no real
-`iab` browser. The installer patches the local `browser-use` plugin cache so
-that `iab` is treated as an alias for the Chromium extension backend. This lets
-official Browser skill code such as `agent.browsers.get("iab")` continue to
-work while using Chromium behind the scenes.
+`iab` browser. The installer patches the local `browser-use` skill so Browser
+tasks still start from the `@browser` entrypoint but select the Chromium-backed
+`extension` backend with `agent.browsers.get("extension")`.
+
+Earlier versions tried to make `iab` an alias for the extension backend. That
+was close enough for lightweight DOM reads, but it was not equivalent for
+page-level CDP operations: viewport screenshots could detach even though the
+same Chromium extension worked through the Chrome plugin's native `extension`
+backend. The current routing keeps the official extension backend identity and
+only changes the Linux Browser skill's bootstrap target.
 
 This routing patch is intentionally Linux-local. It does not make the host show
 up as a first-class Codex Desktop in-app browser, and it does not change the
@@ -154,10 +160,11 @@ retried instead of waiting for the outer MCP transport to close.
 For visible screenshots, the installer also patches the Linux Chromium client
 path to call `Page.captureScreenshot` for the current viewport directly. The
 official client normally asks `Page.getLayoutMetrics` for `cssVisualViewport`
-and then captures a clipped rectangle. That is valid, but on some Raspberry Pi
-or server Chromium sessions the clipped path can hang even when the page DOM is
-responsive. The Linux patch keeps screenshot support enabled while avoiding
-that slower path for normal viewport screenshots.
+and `Runtime.evaluate("window.devicePixelRatio")`, then captures a clipped
+rectangle. That is valid, but on some Raspberry Pi or server Chromium sessions
+the clipped path can hang even when the page DOM is responsive. The Linux patch
+keeps screenshot support enabled while avoiding those extra CDP calls for normal
+viewport screenshots.
 
 The native host bridge also serializes writes to Chromium stdout and waits for
 Node's `drain` event when the Chrome native-messaging pipe reports backpressure.
@@ -174,6 +181,10 @@ can leave an orphaned extension/CDP command that later fails as `Detached while
 handling command`; restarting the bridge forces Chromium to establish a clean
 native-messaging pipe. Set `CODEX_NATIVE_HOST_EXIT_ON_ORPHANED_PENDING=0` to
 disable this recovery behavior.
+
+After that reset, callers must create a new tab and navigate to the target URL
+again. Reusing an existing tab by URL can bind the new REPL context to a tab
+that still has an orphaned page-level command in flight.
 
 ## Install Safety
 

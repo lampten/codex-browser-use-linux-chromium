@@ -410,6 +410,7 @@ function patchBrowserClient(text) {
   output = patchBrowserClientPageCommandTimeouts(output);
   output = patchBrowserClientCdpCallTimeouts(output);
   output = patchBrowserClientFastVisibleScreenshots(output);
+  output = patchBrowserClientVisibleScreenshotLazyDpr(output);
   return output;
 }
 
@@ -516,6 +517,8 @@ function patchBrowserClientCdpCallTimeouts(text) {
 
 const BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-fast-visible-screenshots";
+const BROWSER_CLIENT_VISIBLE_SCREENSHOT_LAZY_DPR_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-visible-screenshot-lazy-dpr";
 
 function patchBrowserClientFastVisibleScreenshots(text) {
   if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
@@ -541,33 +544,43 @@ function patchBrowserClientFastVisibleScreenshots(text) {
   return `/* ${BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
 }
 
+function patchBrowserClientVisibleScreenshotLazyDpr(text) {
+  if (text.includes(BROWSER_CLIENT_VISIBLE_SCREENSHOT_LAZY_DPR_PATCH_MARKER)) return text;
+
+  let output = replaceRegexRequired(
+    text,
+    /x\("playwright_screenshot",async\(t,e\)=>\{let r=([A-Za-z_$][A-Za-z0-9_$]*)\(t\.tab_id\),n=\{format:"png"\},o=([A-Za-z_$][A-Za-z0-9_$]*)\(t\),i=await ([A-Za-z_$][A-Za-z0-9_$]*)\(r,e\);if\(o!=null\)n\.captureBeyondViewport=!0,n\.clip=\{\.\.\.o,scale:i\};else if\(t\.fullPage===!0\)\{/,
+    'x("playwright_screenshot",async(t,e)=>{let r=$1(t.tab_id),n={format:"png"},o=$2(t),i=1;if(o!=null)i=await $3(r,e),n.captureBeyondViewport=!0,n.clip={...o,scale:i};else if(t.fullPage===!0){i=await $3(r,e);',
+    "Browser client visible screenshot lazy devicePixelRatio"
+  );
+
+  return `/* ${BROWSER_CLIENT_VISIBLE_SCREENSHOT_LAZY_DPR_PATCH_MARKER} */\n${output}`;
+}
+
+const BROWSER_USE_EXTENSION_BACKEND_MARKER =
+  "codex-browser-use-linux-chromium: browser-use-extension-backend";
 const BROWSER_USE_IAB_CHROME_ROUTING_MARKER =
   "codex-browser-use-linux-chromium: browser-use-iab-routes-to-chrome";
 
 function patchBrowserUseClient(text) {
   let output = patchBrowserClient(text);
+  output = output.replace(
+    new RegExp(`/\\* ${escapeRegExp(BROWSER_USE_IAB_CHROME_ROUTING_MARKER)} \\*/\\n?`, "g"),
+    ""
+  );
+  output = output.replace(
+    /var ([A-Za-z_$][A-Za-z0-9_$]*)=\{cdp:"cdp",extension:"iab",iab:"iab"\};/g,
+    'var $1={cdp:"cdp",extension:"chrome",iab:"iab"};'
+  );
+  output = output.replace(/case"extension":return"iab";/g, 'case"extension":return"extension";');
   if (
-    !output.includes('extension:"iab"') ||
-    !output.includes('case"extension":return"iab"')
+    !/var [A-Za-z_$][A-Za-z0-9_$]*=\{cdp:"cdp",extension:"chrome",iab:"iab"\};/.test(output) ||
+    !output.includes('case"extension":return"extension"')
   ) {
-    const backendAliasPattern =
-      /var ([A-Za-z_$][A-Za-z0-9_$]*)=\{cdp:"cdp",extension:"chrome",iab:"iab"\};/;
-    if (!backendAliasPattern.test(output)) {
-      throw new Error("Could not find patch point for Browser Use extension backend allowlist alias");
-    }
-    output = output.replace(
-      backendAliasPattern,
-      'var $1={cdp:"cdp",extension:"iab",iab:"iab"};'
-    );
-    output = replaceRequired(
-      output,
-      'case"extension":return"extension";',
-      'case"extension":return"iab";',
-      "Browser Use extension backend browser type alias"
-    );
+    throw new Error("Could not normalize Browser Use extension backend routing");
   }
-  if (!output.includes(BROWSER_USE_IAB_CHROME_ROUTING_MARKER)) {
-    output = `/* ${BROWSER_USE_IAB_CHROME_ROUTING_MARKER} */\n${output}`;
+  if (!output.includes(BROWSER_USE_EXTENSION_BACKEND_MARKER)) {
+    output = `/* ${BROWSER_USE_EXTENSION_BACKEND_MARKER} */\n${output}`;
   }
   return output;
 }
@@ -680,8 +693,10 @@ function patchOpenChromeWindow(text) {
 
 const SCREENSHOT_OUTPUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: screenshot-output-compatibility";
-const BROWSER_SKILL_ROUTING_PATCH_MARKER =
+const BROWSER_SKILL_LEGACY_ROUTING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-skill-routes-iab-to-chrome";
+const BROWSER_SKILL_ROUTING_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-skill-routes-to-extension-backend";
 const BROWSER_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-node-repl-discovery";
 const BROWSER_SKILL_TIMEOUT_PATCH_MARKER =
@@ -696,12 +711,19 @@ const CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-command-scoping";
 
 function patchBrowserSkill(text) {
+  text = text.replace(
+    new RegExp(escapeRegExp(BROWSER_SKILL_LEGACY_ROUTING_PATCH_MARKER), "g"),
+    BROWSER_SKILL_ROUTING_PATCH_MARKER
+  );
   if (
     text.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
-    text.includes("do not silently replace a requested screenshot with text-only output")
+    text.includes('agent.browsers.get("extension")') &&
+    text.includes('do not use `agent.browsers.get("iab")` on this host') &&
+    text.includes("do not silently replace a requested screenshot with text-only output") &&
+    text.includes("create a new tab and navigate to the target URL again")
   ) {
     return text;
   }
@@ -725,7 +747,23 @@ function patchBrowserSkill(text) {
 <!-- ${BROWSER_SKILL_TIMEOUT_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER} -->
 
-On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the normal \`iab\` Browser workflow. The local runtime maps \`iab\` to the Chromium-backed Codex Chrome Extension because Linux remote hosts do not have a Codex Desktop in-app browser. Do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
+On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the Browser plugin entrypoint, but select the Chromium-backed extension backend with \`agent.browsers.get("extension")\`. Linux remote hosts do not have a Codex Desktop in-app browser, so do not use \`agent.browsers.get("iab")\` on this host and do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
+
+This Linux section overrides the generic Bootstrap examples below when they say to select \`iab\`. Use this first Browser cell on Linux:
+
+\`\`\`js
+if (!globalThis.agent) {
+  const { setupAtlasRuntime } = await import("<plugin root>/scripts/browser-client.mjs");
+  await setupAtlasRuntime({ globals: globalThis });
+}
+if (!globalThis.browser) {
+  globalThis.browser = await agent.browsers.get("extension");
+}
+await browser.nameSession("short task name");
+if (typeof tab === "undefined") {
+  globalThis.tab = await browser.tabs.new();
+}
+\`\`\`
 
 For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
 
@@ -735,12 +773,23 @@ Keep each browser bridge call short and single-purpose on Linux Chromium. Do not
 
 For page extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
-If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Browser runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
+If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, run \`js_reset\`, re-bootstrap the Browser runtime, create a new tab and navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, reacquire the tab, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, create a new tab, navigate to the target URL again, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
-  return output.replace(bootstrapHeader, `${section}## Bootstrap`);
+  output = output.replace(bootstrapHeader, `${section}## Bootstrap`);
+  output = output.replace(/agent\.browsers\.get\("iab"\)/g, 'agent.browsers.get("extension")');
+  output = output.replace(/agent\.browsers\.get\('iab'\)/g, "agent.browsers.get('extension')");
+  output = output.replace(
+    /do not use `agent\.browsers\.get\("extension"\)` on this host/g,
+    'do not use `agent.browsers.get("iab")` on this host'
+  );
+  output = output.replace(
+    /do not use `agent\.browsers\.get\('extension'\)` on this host/g,
+    "do not use `agent.browsers.get('iab')` on this host"
+  );
+  return output;
 }
 
 function patchChromeSkill(text) {
@@ -750,7 +799,8 @@ function patchChromeSkill(text) {
     text.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
     text.includes("final answer must include the Markdown image link") &&
-    text.includes("do not silently replace a requested screenshot with text-only output")
+    text.includes("do not silently replace a requested screenshot with text-only output") &&
+    text.includes("create a new tab and navigate to the target URL again")
   ) {
     return text;
   }
@@ -819,9 +869,9 @@ Keep each Chromium bridge call short and single-purpose. Do not combine click, f
 
 For extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
-If a call fails with \`native pipe is closed\` or \`Detached while handling command\`, run \`js_reset\`, re-bootstrap the Chrome runtime, reacquire the tab, and continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects after that error.
+If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, run \`js_reset\`, re-bootstrap the Chrome runtime, create a new tab and navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, reacquire the tab, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
+If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, create a new tab, navigate to the target URL again, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);
@@ -1302,11 +1352,13 @@ function patchStatusForRoot(root, paths) {
     const pluginJson = read(".codex-plugin/plugin.json");
     return {
       ...status,
-      browserUseIabRoutesToChrome:
-        browserClient.includes(BROWSER_USE_IAB_CHROME_ROUTING_MARKER) &&
-        browserClient.includes('extension:"iab"') &&
-        browserClient.includes('case"extension":return"iab"'),
-      browserSkillRoutesIabToChrome: browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER),
+      browserUseExtensionBackend:
+        browserClient.includes(BROWSER_USE_EXTENSION_BACKEND_MARKER) &&
+        browserClient.includes('extension:"chrome"') &&
+        browserClient.includes('case"extension":return"extension"'),
+      browserSkillRoutesToExtensionBackend:
+        browserSkill.includes(BROWSER_SKILL_ROUTING_PATCH_MARKER) &&
+        browserSkill.includes('agent.browsers.get("extension")'),
       browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
       browserSkillTimeoutRecovery: browserSkill.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER),
       browserSkillCommandScoping: browserSkill.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER),
