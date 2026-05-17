@@ -297,10 +297,11 @@ If `mcp__node_repl__js` appears to hang, check for old
 JavaScript tool has a default 100 second timeout; override it with
 `CODEX_NODE_REPL_JS_TIMEOUT_MS=0` to disable the timeout or another millisecond
 value to tune it. The `js` tool also accepts per-call `timeout_ms`/`timeoutMs`
-values, matching the official runtime's call shape. A timeout returns an MCP
-error but keeps the stdio transport open, so follow-up calls such as `js_reset`
-can still recover the session. By default the runtime destroys native browser
-pipe connections and resets the JS context after a timeout; set
+values, matching the official runtime's call shape. A timeout returns a normal
+MCP tool result with `isError: true` instead of a JSON-RPC transport error, so
+the model can read the recovery instruction and continue with follow-up calls
+such as `js_reset`. By default the runtime destroys native browser pipe
+connections and resets the JS context after a timeout; set
 `CODEX_NODE_REPL_RESET_ON_TIMEOUT=0` only if you need to preserve in-memory JS
 state across timeouts. Set `CODEX_NODE_REPL_EXIT_ON_TIMEOUT=1` only if you
 explicitly want timeout errors to terminate the MCP process.
@@ -310,15 +311,15 @@ hint. `domSnapshot()` and screenshot capture are normal supported Browser Use
 features on Linux Chromium; the compatibility layer should not steer agents to
 silently avoid them. With `--patch-chromium-extension`, normal viewport
 screenshots first use `chrome.tabs.captureVisibleTab`, so they no longer depend
-on `Page.captureScreenshot`. If lightweight calls such as `browser.tabs.list()`,
-`tab.url()`, and `tab.title()` still work while `domSnapshot`, full-page/cropped
-screenshot, click, fill, or keyboard calls keep timing out, treat it as a
-page-level browser bridge hang. Run `js_reset`, re-bootstrap, create a new tab,
-navigate to the target URL again, and retry the requested evidence in a fresh
+on `Page.captureScreenshot`. After a `js` timeout or stale bridge error, do not
+run a lightweight tab check such as `tab.url()` or `tab.title()` before
+re-bootstrap: the runtime resets the JS context by default, so `tab is not
+defined` is expected. Run `js_reset`, re-bootstrap, create a new tab, navigate
+to the target URL again, and retry the requested evidence in a fresh
 single-purpose call. Do not recover by finding an existing tab with the same URL
 after a bridge reset; that tab may still be tied to an orphaned CDP command. If
-it still fails, report that page-level blocker instead of claiming the screenshot
-or DOM feature is unavailable.
+it still fails after a fresh bootstrap, report that page-level blocker instead
+of claiming the screenshot or DOM feature is unavailable.
 
 On Linux Chromium, keep browser bridge calls short and single-purpose. Do not
 combine click/fill/keyboard/navigation with `domSnapshot()`, screenshots, dev
@@ -329,7 +330,9 @@ compact targeted `evaluate` only when the task does not need the full tree. If a
 call fails with `native pipe is closed`, `Detached while handling command`, or
 `Timed out after ... waiting for CDP command`, the REPL resets its stale browser
 context by default; run `js_reset`, re-bootstrap, create a new tab, and navigate
-to the target URL again before retrying.
+to the target URL again before retrying. A follow-up `tab is not defined` error
+means the caller skipped that bootstrap step and tried to use a stale tab
+binding.
 
 If Chromium accumulates tabs from Browser/Chrome tasks, use the `browser_cleanup`
 MCP tool on the same `node_repl`/`browser_node_repl` server. It runs the Browser

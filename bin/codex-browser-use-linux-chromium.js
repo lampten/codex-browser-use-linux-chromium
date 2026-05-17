@@ -962,7 +962,8 @@ function patchBrowserSkill(text) {
     text.includes('do not use `agent.browsers.get("iab")` on this host') &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
-    text.includes("browser_cleanup")
+    text.includes("browser_cleanup") &&
+    text.includes("Do not run a lightweight tab check after a timeout/reset")
   ) {
     return text;
   }
@@ -1014,9 +1015,9 @@ Keep each browser bridge call short and single-purpose on Linux Chromium. Do not
 
 For page extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
-If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, run \`js_reset\`, re-bootstrap the Browser runtime, create a new tab and navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
+If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, the Linux runtime may have reset the JS context and removed old \`browser\` and \`tab\` bindings. Run \`js_reset\`, re-bootstrap the Browser runtime, create a new \`globalThis.tab\`, navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, create a new tab, navigate to the target URL again, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
+Do not run a lightweight tab check after a timeout/reset. Calls such as \`tab.url()\`, \`tab.title()\`, \`browser.tabs.list()\`, or \`browser.tabs.get(...)\` are only valid while the current JS context still has live \`browser\` and \`tab\` bindings. After a timeout or stale bridge error, first re-bootstrap and create a fresh tab; otherwise \`tab is not defined\` is the expected failure, not useful evidence. If page-level calls still time out after a fresh bootstrap, report that page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
   output = output.replace(bootstrapHeader, `${section}## Bootstrap`);
@@ -1042,7 +1043,8 @@ function patchChromeSkill(text) {
     text.includes("final answer must include the Markdown image link") &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
-    text.includes("browser_cleanup")
+    text.includes("browser_cleanup") &&
+    text.includes("Do not run a lightweight tab check after a timeout/reset")
   ) {
     return text;
   }
@@ -1113,9 +1115,9 @@ Keep each Chromium bridge call short and single-purpose. Do not combine click, f
 
 For extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
 
-If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, run \`js_reset\`, re-bootstrap the Chrome runtime, create a new tab and navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
+If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, the Linux runtime may have reset the JS context and removed old \`browser\` and \`tab\` bindings. Run \`js_reset\`, re-bootstrap the Chrome runtime, create a new \`globalThis.tab\`, navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
-If lightweight calls such as \`browser.tabs.list()\`, \`browser.tabs.get(...)\`, \`tab.url()\`, or \`tab.title()\` succeed but page-level calls such as \`tab.playwright.domSnapshot()\`, \`tab.playwright.screenshot()\`, \`tab.cua.get_visible_screenshot()\`, fill, click, or keyboard input time out repeatedly, treat it as a page-level browser bridge hang rather than missing MCP discovery. Run \`js_reset\`, re-bootstrap, create a new tab, navigate to the target URL again, and retry the requested evidence in a fresh call. If it still fails, report the page-level blocker; do not claim the screenshot or DOM feature is unavailable.
+Do not run a lightweight tab check after a timeout/reset. Calls such as \`tab.url()\`, \`tab.title()\`, \`browser.tabs.list()\`, or \`browser.tabs.get(...)\` are only valid while the current JS context still has live \`browser\` and \`tab\` bindings. After a timeout or stale bridge error, first re-bootstrap and create a fresh tab; otherwise \`tab is not defined\` is the expected failure, not useful evidence. If page-level calls still time out after a fresh bootstrap, report that page-level blocker; do not claim the screenshot or DOM feature is unavailable.
 
 `;
   return output.replace(tabCleanupHeader, `${section}## Tab Cleanup`);

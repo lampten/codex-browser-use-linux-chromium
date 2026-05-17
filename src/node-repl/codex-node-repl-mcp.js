@@ -60,6 +60,7 @@ let endRequested = false;
 let shutdownStarted = false;
 let timeoutExitRequested = false;
 let consecutiveJsTimeouts = 0;
+let lastContextResetReason = null;
 
 function log(message, extra) {
   try {
@@ -451,8 +452,11 @@ function codeRequestsBrowserFinalize(code) {
 
 class JsTimeoutError extends Error {
   constructor(timeoutMs, consecutiveTimeouts = 1) {
+    const recovery = RESET_ON_TIMEOUT
+      ? "The Browser JS context was reset after this timeout; `tab`, `browser`, and `agent` handles from earlier calls are no longer defined. Next run js_reset or the full Browser bootstrap, create a new tab, navigate to the target URL again, and only then retry. Do not call tab.url(), tab.title(), or other tab.* methods as a lightweight check before re-bootstrap."
+      : "Run js_reset, re-bootstrap the Browser runtime, create a new tab, navigate to the target URL again, and only then retry. Do not call tab.url(), tab.title(), or other tab.* methods as a lightweight check after this timeout.";
     super(
-      `js tool timed out after ${timeoutMs}ms; node_repl MCP transport remains open for follow-up calls; consecutive_js_timeouts=${consecutiveTimeouts}. If lightweight browser calls still work but tab.playwright/tab.cua/fill/click/keyboard calls keep timing out, run js_reset and stop retrying the same page-level operation.`
+      `js tool timed out after ${timeoutMs}ms; node_repl MCP transport remains open for follow-up calls; consecutive_js_timeouts=${consecutiveTimeouts}. ${recovery}`
     );
     this.name = "JsTimeoutError";
   }
@@ -577,11 +581,31 @@ function sendError(id, error) {
   });
 }
 
+function toolErrorResult(error) {
+  return {
+    isError: true,
+    content: [{ type: "text", text: errorMessage(error) }],
+  };
+}
+
 function errorMessage(error) {
   const message = error && error.message ? error.message : String(error);
+  if (isMissingBrowserTabError(error)) return browserTabMissingMessage(message);
   if (!isBrowserBridgeStaleError(error)) return message;
   if (/js_reset|re-bootstrap/i.test(message)) return message;
   return `${message}. Browser bridge state was reset; run js_reset, re-bootstrap the runtime, create a new tab, and navigate to the target URL again before retrying. Do not reuse an existing tab with the same URL after this error.`;
+}
+
+function isMissingBrowserTabError(error) {
+  const message = error && error.message ? error.message : String(error);
+  return /\btab is not defined\b/i.test(message);
+}
+
+function browserTabMissingMessage(message) {
+  const resetContext = lastContextResetReason
+    ? ` The previous Browser JS context was reset after ${lastContextResetReason}.`
+    : "";
+  return `${message}.${resetContext} Re-run the full Browser bootstrap, assign globalThis.browser, create a fresh globalThis.tab, and navigate to the target URL before using tab.* again. Do not use tab.url() or tab.title() as a lightweight check until a new tab binding exists.`;
 }
 
 function isBrowserBridgeStaleError(error) {
@@ -611,6 +635,7 @@ async function callTool(name, args = {}) {
           if (RESET_ON_TIMEOUT) {
             disposeContextResources(context, "timeout");
             context = null;
+            lastContextResetReason = "timeout";
           }
         },
         () => new JsTimeoutError(timeoutMs, consecutiveJsTimeouts + 1)
@@ -618,12 +643,19 @@ async function callTool(name, args = {}) {
       consecutiveJsTimeouts = 0;
       return result;
     } catch (error) {
-      if (error instanceof JsTimeoutError) consecutiveJsTimeouts += 1;
-      else if (RESET_ON_BROWSER_BRIDGE_ERROR && isBrowserBridgeStaleError(error)) {
+      if (error instanceof JsTimeoutError) {
+        consecutiveJsTimeouts += 1;
+        if (EXIT_ON_TIMEOUT) scheduleTimeoutExit();
+        return toolErrorResult(error);
+      }
+      if (RESET_ON_BROWSER_BRIDGE_ERROR && isBrowserBridgeStaleError(error)) {
         log("browser bridge error cleanup", error.message || String(error));
         disposeContextResources(context, "browser-bridge-error");
         context = null;
+        lastContextResetReason = "browser bridge error";
+        return toolErrorResult(error);
       }
+      if (isMissingBrowserTabError(error)) return toolErrorResult(error);
       throw error;
     } finally {
       log("js call finished", `duration_ms=${Date.now() - startedAt} ${summarizeJsArgs(args)}`);
@@ -631,6 +663,7 @@ async function callTool(name, args = {}) {
   }
   if (name === "js_reset") {
     consecutiveJsTimeouts = 0;
+    lastContextResetReason = "js_reset";
     const cleanupResult = CLEANUP_TABS_ON_RESET
       ? await cleanupBrowserTabsWithTimeout(context, "js_reset")
       : { status: "skipped", reason: "disabled" };

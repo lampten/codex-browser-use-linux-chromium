@@ -135,8 +135,9 @@ look detached to the next call.
 
 The `js` tool also has a process-level timeout controlled by
 `CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 100000 ms. When a JavaScript
-call times out, the MCP server returns an error but keeps its stdio transport
-open so the same Codex turn can still run recovery calls such as `js_reset`.
+call times out, the MCP server returns a normal tool result with `isError: true`
+rather than a JSON-RPC transport error, so the same Codex turn can still read
+the recovery instruction and run calls such as `js_reset`.
 After a timeout, the compatibility runtime destroys native browser pipe sockets
 and resets the JS context by default; this prevents the timed-out Browser Use
 promise from continuing to occupy the extension channel while later calls run.
@@ -200,6 +201,12 @@ disable this recovery behavior.
 After that reset, callers must create a new tab and navigate to the target URL
 again. Reusing an existing tab by URL can bind the new REPL context to a tab
 that still has an orphaned page-level command in flight.
+
+The reset also removes JS variables from the previous context. A follow-up
+`tab.url()` or `tab.title()` call immediately after timeout therefore fails with
+`tab is not defined`; that is a caller recovery bug, not useful evidence about
+browser health. The next Browser/Chrome call after a timeout must run the full
+bootstrap and create a new `globalThis.tab` before using any `tab.*` method.
 
 ## Tab Lifecycle Cleanup
 
