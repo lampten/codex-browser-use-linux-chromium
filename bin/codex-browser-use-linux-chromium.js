@@ -10,6 +10,7 @@ const PROJECT_ROOT = path.resolve(__dirname, "..");
 const APP_NAME = "codex-browser-use-linux-chromium";
 const DEFAULT_EXTENSION_ID = "hehggadaopoacecdllhhajmbjkdcmajg";
 const DEFAULT_NATIVE_HOST_NAME = "com.openai.codexextension";
+const DEFAULT_CHROMIUM_EXTENSION_ROOT = "/usr/share/chromium/extensions/codex";
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const BACKUP_SUFFIX = ".codex-browser-use-linux-chromium.bak.";
 const TOOL_SEARCH_DEFER_FEATURE = "tool_search_always_defer_mcp_tools";
@@ -31,7 +32,10 @@ function usage() {
   node bin/codex-browser-use-linux-chromium.js install [options]
   node bin/codex-browser-use-linux-chromium.js doctor [options]
   node bin/codex-browser-use-linux-chromium.js patch-plugin [options]
+  node bin/codex-browser-use-linux-chromium.js patch-extension [options]
+  node bin/codex-browser-use-linux-chromium.js reset-extension-cache [options]
   node bin/codex-browser-use-linux-chromium.js restore-plugin [options]
+  node bin/codex-browser-use-linux-chromium.js restore-extension [options]
 
 Options:
   --codex-home PATH          Codex home directory. Default: ~/.codex
@@ -39,8 +43,10 @@ Options:
   --browser-config-root PATH Browser config root. Default: ~/.config
   --plugin-root PATH         Patch this plugin root. Can be repeated.
   --extension-id ID          Chrome extension ID. Default: ${DEFAULT_EXTENSION_ID}
+  --extension-root PATH      Chromium Codex extension root. Default: ${DEFAULT_CHROMIUM_EXTENSION_ROOT}
   --native-host-name NAME    Native host name. Default: ${DEFAULT_NATIVE_HOST_NAME}
   --system-native-host       Also install system Chromium/Chrome native host manifests.
+  --patch-chromium-extension Patch the system Chromium Codex extension for non-CDP screenshots.
   --desktop-shims            Install macOS Codex Desktop remote path shims.
   --windows-shims            Install Windows Codex Desktop remote path shims.
   --windows-username NAME    Windows username for generated shims. Can be repeated.
@@ -83,8 +89,10 @@ function parseArgs(argv) {
     else if (arg === "--browser-config-root") args.browserConfigRoot = next();
     else if (arg === "--plugin-root") args.pluginRoots.push(next());
     else if (arg === "--extension-id") args.extensionId = next();
+    else if (arg === "--extension-root") args.extensionRoot = next();
     else if (arg === "--native-host-name") args.nativeHostName = next();
     else if (arg === "--system-native-host") args.systemNativeHost = true;
+    else if (arg === "--patch-chromium-extension") args.patchChromiumExtension = true;
     else if (arg === "--desktop-shims") args.desktopShims = true;
     else if (arg === "--windows-shims") args.windowsShims = true;
     else if (arg === "--windows-username") args.windowsUsernames.push(next());
@@ -103,6 +111,7 @@ function parseArgs(argv) {
     expandHome(args.installRoot || path.join(home, ".local", "share", APP_NAME))
   );
   args.browserConfigRoot = path.resolve(expandHome(args.browserConfigRoot || path.join(home, ".config")));
+  args.extensionRoot = path.resolve(expandHome(args.extensionRoot || DEFAULT_CHROMIUM_EXTENSION_ROOT));
   args.extensionId = args.extensionId || DEFAULT_EXTENSION_ID;
   args.nativeHostName = args.nativeHostName || DEFAULT_NATIVE_HOST_NAME;
   args.pluginRoots = args.pluginRoots.map((root) => path.resolve(expandHome(root)));
@@ -152,6 +161,20 @@ function writeFile(filePath, contents, mode, args) {
   mkdirp(path.dirname(filePath), args);
   fs.writeFileSync(filePath, contents);
   if (mode != null) fs.chmodSync(filePath, mode);
+}
+
+function canWritePath(filePath) {
+  try {
+    fs.accessSync(fs.existsSync(filePath) ? filePath : path.dirname(filePath), fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writePossiblyPrivilegedFile(filePath, contents, mode, args) {
+  if (canWritePath(filePath)) writeFile(filePath, contents, mode, args);
+  else writePrivilegedFile(filePath, contents, mode == null ? "0644" : mode.toString(8).padStart(4, "0"), args);
 }
 
 function copyFile(src, dest, mode, args) {
@@ -209,6 +232,60 @@ function browserUseSocketStatus(socketDir = DEFAULT_SOCKET_DIR) {
         stale: isSocket && !ownerProcessAlive,
       };
     });
+}
+
+function chromiumUserDataDir(args) {
+  return path.join(args.browserConfigRoot, "chromium");
+}
+
+function runningChromiumSingletonPid(args) {
+  const singletonLock = path.join(chromiumUserDataDir(args), "SingletonLock");
+  if (!fs.existsSync(singletonLock)) return null;
+  let target;
+  try {
+    target = fs.readlinkSync(singletonLock);
+  } catch {
+    return null;
+  }
+  const match = target.match(/-(\d+)$/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 && processExists(pid) ? pid : null;
+}
+
+function chromiumProfileDirs(args) {
+  const userDataDir = chromiumUserDataDir(args);
+  if (!fs.existsSync(userDataDir)) return [];
+  return fs
+    .readdirSync(userDataDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && (entry.name === "Default" || /^Profile \d+$/.test(entry.name)))
+    .map((entry) => path.join(userDataDir, entry.name));
+}
+
+function resetChromiumExtensionCache(args) {
+  requireLinuxWrites(args);
+  const runningPid = runningChromiumSingletonPid(args);
+  if (runningPid != null && !args.dryRun) {
+    throw new Error(
+      `Chromium is still running for ${chromiumUserDataDir(args)} (pid ${runningPid}). Close Chromium before resetting extension service worker cache.`
+    );
+  }
+
+  let changed = 0;
+  for (const profileDir of chromiumProfileDirs(args)) {
+    const serviceWorkerDir = path.join(profileDir, "Service Worker");
+    if (!fs.existsSync(serviceWorkerDir)) continue;
+    const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+    const backupPath = `${serviceWorkerDir}${BACKUP_SUFFIX}${stamp}`;
+    if (args.dryRun) {
+      logAction(args, `move ${serviceWorkerDir} -> ${backupPath}`);
+    } else {
+      fs.renameSync(serviceWorkerDir, backupPath);
+    }
+    changed += 1;
+    logAction(args, `reset extension service worker cache: ${profileDir}`);
+  }
+  if (changed === 0) logAction(args, `no Chromium service worker cache found under ${chromiumUserDataDir(args)}`);
 }
 
 function runtimePaths(args) {
@@ -345,6 +422,18 @@ function backupFile(filePath, args) {
   return backupPath;
 }
 
+function backupPossiblyPrivilegedFile(filePath, args) {
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+  const backupPath = `${filePath}${BACKUP_SUFFIX}${stamp}`;
+  if (args.dryRun) {
+    logAction(args, `backup ${filePath} -> ${backupPath}`);
+    return backupPath;
+  }
+  if (canWritePath(backupPath)) fs.copyFileSync(filePath, backupPath);
+  else sudoExec(["cp", filePath, backupPath]);
+  return backupPath;
+}
+
 function planTextPatch(filePath, patcher) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Required plugin file is missing: ${filePath}`);
@@ -411,6 +500,8 @@ function patchBrowserClient(text) {
   output = patchBrowserClientCdpCallTimeouts(output);
   output = patchBrowserClientFastVisibleScreenshots(output);
   output = patchBrowserClientVisibleScreenshotLazyDpr(output);
+  output = patchBrowserClientExtensionVisibleScreenshots(output);
+  output = patchBrowserClientPreferExtensionVisibleScreenshots(output);
   return output;
 }
 
@@ -519,6 +610,10 @@ const BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-fast-visible-screenshots";
 const BROWSER_CLIENT_VISIBLE_SCREENSHOT_LAZY_DPR_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-visible-screenshot-lazy-dpr";
+const BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-extension-visible-screenshots";
+const BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-prefer-extension-visible-screenshots";
 
 function patchBrowserClientFastVisibleScreenshots(text) {
   if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
@@ -557,6 +652,44 @@ function patchBrowserClientVisibleScreenshotLazyDpr(text) {
   return `/* ${BROWSER_CLIENT_VISIBLE_SCREENSHOT_LAZY_DPR_PATCH_MARKER} */\n${output}`;
 }
 
+function patchBrowserClientExtensionVisibleScreenshots(text) {
+  if (text.includes(BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
+
+  let output = replaceRegexRequired(
+    text,
+    /(function re\(t\)\{let e=typeof t\.timeout_ms=="number"\?t\.timeout_ms:typeof t\.client_timeout_ms=="number"\?t\.client_timeout_ms:3e3;return Math\.min\(Math\.max\(0,e\),t\.max\|\|3e3\)\})/,
+    `$1async function codexLinuxCaptureVisibleTab(t,e,r={}){try{let n=await e.api.sendSessionRequest("captureVisibleTab",{tabId:t,format:r.format??"jpeg",quality:r.quality??80});let o=n?.data;if(typeof o=="string"&&o)return o}catch{}return null}`,
+    "Browser client extension visible screenshot helper"
+  );
+  output = replaceRegexRequired(
+    output,
+    /var ([A-Za-z_$][A-Za-z0-9_$]*)=x\("cua_get_visible_screenshot",async\(t,e\)=>\{let r=([A-Za-z_$][A-Za-z0-9_$]*)\(t\.tab_id\),([A-Za-z_$][A-Za-z0-9_$]*)=await e\.cdp\.call\(r,"Page\.captureScreenshot",\{format:"jpeg",quality:80,optimizeForSpeed:!0\},\{timeoutMs:re\(\{\.\.\.t,timeout_ms:t\.timeout_ms\?\?2e4,max:3e4\}\)\}\);if\(typeof \3\.data!="string"\|\|!\3\.data\)throw new Error\(`Page\.captureScreenshot returned no data for tab \$\{r\}\.`\);return\{data:\3\.data\}\}\);/,
+    'var $1=x("cua_get_visible_screenshot",async(t,e)=>{let r=$2(t.tab_id),n=await codexLinuxCaptureVisibleTab(r,e,{format:"jpeg",quality:80});if(n)return{data:n};let $3=await e.cdp.call(r,"Page.captureScreenshot",{format:"jpeg",quality:80,optimizeForSpeed:!0},{timeoutMs:re({...t,timeout_ms:t.timeout_ms??2e4,max:3e4})});if(typeof $3.data!="string"||!$3.data)throw new Error(`Page.captureScreenshot returned no data for tab ${r}.`);return{data:$3.data}});',
+    "Browser client CUA visible screenshot extension fallback"
+  );
+  output = replaceRegexRequired(
+    output,
+    /else n\.optimizeForSpeed=!0;let ([A-Za-z_$][A-Za-z0-9_$]*)=await e\.cdp\.call\(r,"Page\.captureScreenshot",n,\{timeoutMs:re\(\{\.\.\.t,timeout_ms:t\.timeout_ms\?\?2e4,max:3e4\}\)\}\);/,
+    'else{let u=await codexLinuxCaptureVisibleTab(r,e,{format:"png"});if(u)return{data:u};n.optimizeForSpeed=!0}let $1=await e.cdp.call(r,"Page.captureScreenshot",n,{timeoutMs:re({...t,timeout_ms:t.timeout_ms??2e4,max:3e4})});',
+    "Browser client Playwright visible screenshot extension fallback"
+  );
+
+  return `/* ${BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
+}
+
+function patchBrowserClientPreferExtensionVisibleScreenshots(text) {
+  if (text.includes(BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
+
+  const output = replaceRequired(
+    text,
+    'async function LO(t){let e=[],r=[];for(let n of t)$S(Zf(n.info.type))?e.push(n):r.push(n);return await Promise.all(r.map(({api:n})=>n.close())),e}',
+    'async function LO(t){let e=[],r=[];for(let n of t)$S(Zf(n.info.type))?e.push(n):r.push(n);return e.sort((n,o)=>(o.info?.metadata?.codexLinuxCaptureVisibleTab===!0)-(n.info?.metadata?.codexLinuxCaptureVisibleTab===!0)),await Promise.all(r.map(({api:n})=>n.close())),e}',
+    "Browser client prefer patched visible screenshot extension"
+  );
+
+  return `/* ${BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
+}
+
 const BROWSER_USE_EXTENSION_BACKEND_MARKER =
   "codex-browser-use-linux-chromium: browser-use-extension-backend";
 const BROWSER_USE_IAB_CHROME_ROUTING_MARKER =
@@ -583,6 +716,111 @@ function patchBrowserUseClient(text) {
     output = `/* ${BROWSER_USE_EXTENSION_BACKEND_MARKER} */\n${output}`;
   }
   return output;
+}
+
+const CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-capture-visible-tab";
+const CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-capture-visible-tab-metadata";
+const CHROMIUM_EXTENSION_VERSION_NAME_MARKER = "codex-browser-use-linux-chromium";
+
+function chromiumExtensionBackgroundPath(args) {
+  return path.join(args.extensionRoot, "background.js");
+}
+
+function chromiumExtensionManifestPath(args) {
+  return path.join(args.extensionRoot, "manifest.json");
+}
+
+function patchChromiumExtensionBackground(text) {
+  let output = text;
+  if (!output.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'async executeCdp(e){return await this.resolveSession(e).executeCdp(e)}async attach(e)',
+      'async executeCdp(e){return await this.resolveSession(e).executeCdp(e)}async captureVisibleTab(e){return await this.resolveSession(e).captureVisibleTab(e)}async attach(e)',
+      "Chromium extension root captureVisibleTab handler"
+    );
+    output = replaceRequired(
+      output,
+      'async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async attach(e)',
+      'async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async captureVisibleTab(e){const t=e.tabId;ge("captureVisibleTab",t);await this.requireSessionTab(t);const s=await chrome.tabs.get(t);if(typeof s.windowId!="number")throw new Error(`Chrome tab ${t} has no windowId`);if(s.active!==!0)await chrome.tabs.update(t,{active:!0});try{const o=await chrome.windows.get(s.windowId);o.state==="minimized"&&await chrome.windows.update(s.windowId,{state:"normal"}),await chrome.windows.update(s.windowId,{focused:!0})}catch{}this.activeTabId=t;const r=e.format==="png"?"png":"jpeg",n=Number(e.quality),i={format:r};r==="jpeg"&&(i.quality=Number.isFinite(n)?Math.min(100,Math.max(1,Math.trunc(n))):80);const o=await chrome.tabs.captureVisibleTab(s.windowId,i),l=o.match(/^data:image\\/[a-zA-Z0-9.+-]+;base64,(.*)$/);return{data:l?l[1]:o}}async attach(e)',
+      "Chromium extension session captureVisibleTab handler"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER} */\n${output}`;
+  }
+
+  if (!output.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'metadata:{extensionId:chrome.runtime.id,extensionInstanceId:this.extensionInstanceId}',
+      'metadata:{extensionId:chrome.runtime.id,extensionInstanceId:this.extensionInstanceId,codexLinuxCaptureVisibleTab:!0}',
+      "Chromium extension captureVisibleTab metadata"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER} */\n${output}`;
+  }
+
+  return output;
+}
+
+function bumpChromiumExtensionVersion(version) {
+  if (typeof version !== "string" || !/^\d+(?:\.\d+){0,3}$/.test(version)) {
+    throw new Error(`Unsupported Chromium extension version: ${version}`);
+  }
+  const parts = version.split(".").map((part) => Number(part));
+  if (parts.length < 4) return `${version}.1`;
+  if (parts[3] === 0) return `${parts.slice(0, 3).join(".")}.1`;
+  return version;
+}
+
+function patchChromiumExtensionManifest(text) {
+  const manifest = JSON.parse(text);
+  if (typeof manifest.version !== "string") {
+    throw new Error("Chromium extension manifest has no string version");
+  }
+
+  manifest.version = bumpChromiumExtensionVersion(manifest.version);
+  const versionName =
+    typeof manifest.version_name === "string" && manifest.version_name.trim()
+      ? manifest.version_name
+      : manifest.version;
+  if (!versionName.includes(CHROMIUM_EXTENSION_VERSION_NAME_MARKER)) {
+    manifest.version_name = `${versionName} (${CHROMIUM_EXTENSION_VERSION_NAME_MARKER})`;
+  }
+
+  return `${JSON.stringify(manifest, null, 3)}\n`;
+}
+
+function planChromiumExtensionPatch(args) {
+  const backgroundPath = chromiumExtensionBackgroundPath(args);
+  if (!fs.existsSync(backgroundPath)) return null;
+  const manifestPath = chromiumExtensionManifestPath(args);
+  return {
+    background: planTextPatch(backgroundPath, patchChromiumExtensionBackground),
+    manifest: fs.existsSync(manifestPath)
+      ? planTextPatch(manifestPath, patchChromiumExtensionManifest)
+      : null,
+  };
+}
+
+function commitChromiumExtensionPatch(plan, args) {
+  if (!plan) {
+    logAction(args, `Chromium extension background not found: ${chromiumExtensionBackgroundPath(args)}`);
+    return null;
+  }
+  let changed = false;
+  for (const filePlan of [plan.background, plan.manifest].filter(Boolean)) {
+    if (!filePlan.changed) continue;
+    changed = true;
+    backupPossiblyPrivilegedFile(filePlan.filePath, args);
+    writePossiblyPrivilegedFile(filePlan.filePath, filePlan.after, 0o644, args);
+  }
+  logAction(args, `chromium extension: ${changed ? "changed" : "ok"} ${args.extensionRoot}`);
+  return plan;
+}
+
+function patchChromiumExtension(args) {
+  return commitChromiumExtensionPatch(planChromiumExtensionPatch(args), args);
 }
 
 function patchInstalledBrowsers(text) {
@@ -723,7 +961,8 @@ function patchBrowserSkill(text) {
     text.includes('agent.browsers.get("extension")') &&
     text.includes('do not use `agent.browsers.get("iab")` on this host') &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
-    text.includes("create a new tab and navigate to the target URL again")
+    text.includes("create a new tab and navigate to the target URL again") &&
+    text.includes("browser_cleanup")
   ) {
     return text;
   }
@@ -767,6 +1006,8 @@ if (typeof tab === "undefined") {
 
 For Browser plugin tasks, the Linux compatibility MCP server may appear as \`browser_node_repl\` instead of \`node_repl\` to avoid colliding with the Chrome plugin's official \`node_repl\` server. If \`node_repl/js\` is not visible, search for \`browser_node_repl js\` and use \`mcp__browser_node_repl__js\`.
 
+Before ending a Browser task, call \`browser_cleanup\` from the same MCP server when it is visible. It runs the current session's tab finalizer with an empty keep list, equivalent to \`await browser.tabs.finalize({ keep: [] })\`, and avoids leaving Chromium full of task tabs. If \`browser_cleanup\` is not visible, run that finalizer in a final single-purpose \`js\` call.
+
 Screenshots and \`domSnapshot()\` are supported Browser capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
 
 Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, a targeted locator/evaluate check is usually cheaper than \`tab.playwright.domSnapshot()\`, but the full snapshot remains valid when it is the right evidence.
@@ -800,7 +1041,8 @@ function patchChromeSkill(text) {
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
     text.includes("final answer must include the Markdown image link") &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
-    text.includes("create a new tab and navigate to the target URL again")
+    text.includes("create a new tab and navigate to the target URL again") &&
+    text.includes("browser_cleanup")
   ) {
     return text;
   }
@@ -840,6 +1082,8 @@ function patchChromeSkill(text) {
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, Chrome plugin tasks must use the Chrome plugin's \`node_repl\` MCP server. Search for \`node_repl js\` and call \`mcp__node_repl__js\`.
 
 Do not use \`browser_node_repl\` for Chrome plugin tasks. \`browser_node_repl\` is reserved for Browser / in-app browser compatibility and can cause Chrome tasks to follow Browser-specific routing instructions.
+
+Before ending a Chrome task, call \`browser_cleanup\` from \`node_repl\` when it is visible. It runs the current session's tab finalizer with an empty keep list, equivalent to \`await browser.tabs.finalize({ keep: [] })\`, and avoids leaving Chromium full of task tabs. If \`browser_cleanup\` is not visible, run that finalizer in a final single-purpose \`js\` call.
 
 ## Screenshot Output Compatibility
 
@@ -1031,6 +1275,19 @@ function patchPlugins(args) {
 
 function sudoExec(argsList) {
   childProcess.execFileSync("sudo", ["-n", ...argsList], { stdio: "inherit" });
+}
+
+function requirePasswordlessSudo(message) {
+  if (!commandPath("sudo")) {
+    throw new Error(`${message} require sudo, but sudo is not available`);
+  }
+  try {
+    childProcess.execFileSync("sudo", ["-n", "true"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  } catch {
+    throw new Error(`${message} require passwordless sudo. Run with sudo configured, or omit the privileged option and create those files manually.`);
+  }
 }
 
 function writePrivilegedShim(targetFile, contents, args) {
@@ -1270,9 +1527,13 @@ function install(args) {
   preflightInstall(args);
   const paths = runtimePaths(args);
   const pluginPatchPlans = planPluginPatches(args, paths);
+  const chromiumExtensionPatchPlan = args.patchChromiumExtension
+    ? planChromiumExtensionPatch(args)
+    : null;
   installRuntime(args);
   installNativeHostManifests(args, paths);
   commitPluginPatchPlans(pluginPatchPlans, args);
+  if (args.patchChromiumExtension) commitChromiumExtensionPatch(chromiumExtensionPatchPlan, args);
   if (!args.skipFeatureConfig) writeCodexFeatureConfig(args);
   if (args.writeCodexConfig) writeCodexConfig(args, paths);
   if (args.desktopShims) installDesktopShims(args, paths);
@@ -1281,17 +1542,15 @@ function install(args) {
 }
 
 function preflightInstall(args) {
-  if ((!args.desktopShims && !args.systemNativeHost) || args.dryRun) return;
-  if (!commandPath("sudo")) {
-    throw new Error("Requested privileged install paths require sudo, but sudo is not available");
-  }
-  try {
-    childProcess.execFileSync("sudo", ["-n", "true"], {
-      stdio: ["ignore", "ignore", "ignore"],
-    });
-  } catch {
-    throw new Error("Requested privileged install paths require passwordless sudo. Run with sudo configured, or omit --desktop-shims/--system-native-host and create those files manually.");
-  }
+  const extensionPatchPaths = [
+    chromiumExtensionBackgroundPath(args),
+    chromiumExtensionManifestPath(args),
+  ].filter((filePath) => fs.existsSync(filePath));
+  const privilegedExtensionPatch =
+    args.patchChromiumExtension &&
+    extensionPatchPaths.some((filePath) => !canWritePath(filePath));
+  if ((!args.desktopShims && !args.systemNativeHost && !privilegedExtensionPatch) || args.dryRun) return;
+  requirePasswordlessSudo("Requested privileged install paths");
 }
 
 function requireLinuxWrites(args) {
@@ -1346,6 +1605,12 @@ function patchStatusForRoot(root, paths) {
       !/\(import\.meta\.__codexNativePipe\?\?globalThis\.__codexNativePipe\)UnavailableMessage/.test(
         browserClient
       ),
+    browserClientExtensionVisibleScreenshots:
+      browserClient.includes(BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER) &&
+      browserClient.includes("codexLinuxCaptureVisibleTab"),
+    browserClientPrefersExtensionVisibleScreenshots:
+      browserClient.includes(BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER) &&
+      browserClient.includes("codexLinuxCaptureVisibleTab===!0"),
   };
   if (kind !== "chrome") {
     const browserSkill = read("skills/browser/SKILL.md");
@@ -1422,6 +1687,42 @@ function nativeManifestStatus(manifestPath, expectedNativeHostPath) {
   return status;
 }
 
+function chromiumExtensionStatus(args) {
+  const manifestPath = chromiumExtensionManifestPath(args);
+  const backgroundPath = chromiumExtensionBackgroundPath(args);
+  const backgroundText = fs.existsSync(backgroundPath) ? fs.readFileSync(backgroundPath, "utf8") : "";
+  const status = {
+    root: args.extensionRoot,
+    manifestPath,
+    backgroundPath,
+    exists: fs.existsSync(args.extensionRoot),
+    manifestExists: fs.existsSync(manifestPath),
+    backgroundExists: fs.existsSync(backgroundPath),
+    version: null,
+    versionName: null,
+    reloadVersionMarker: false,
+    captureVisibleTabPatch:
+      backgroundText.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER) &&
+      backgroundText.includes("captureVisibleTab"),
+    captureVisibleTabMetadata:
+      backgroundText.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER) &&
+      backgroundText.includes("codexLinuxCaptureVisibleTab:!0"),
+  };
+  if (status.manifestExists) {
+    try {
+      const manifest = readJsonFile(manifestPath);
+      status.version = manifest.version || null;
+      status.versionName = manifest.version_name || null;
+      status.reloadVersionMarker =
+        typeof status.versionName === "string" &&
+        status.versionName.includes(CHROMIUM_EXTENSION_VERSION_NAME_MARKER);
+    } catch (error) {
+      status.error = error.message;
+    }
+  }
+  return status;
+}
+
 function doctor(args) {
   const paths = runtimePaths(args);
   const pluginRoots = detectPluginRoots(args);
@@ -1456,6 +1757,7 @@ function doctor(args) {
     nativeHostManifests: userNativeManifestPaths(args).map((manifestPath) =>
       nativeManifestStatus(manifestPath, paths.nativeHostBridge)
     ),
+    chromiumExtension: chromiumExtensionStatus(args),
     systemNativeHostManifests: systemNativeManifestPaths(args).map((manifestPath) =>
       nativeManifestStatus(manifestPath, paths.nativeHostBridge)
     ),
@@ -1500,6 +1802,17 @@ function doctor(args) {
   );
   console.log(`native host bridge: ${report.runtime.nativeHostBridge.exists ? "ok" : "missing"}`);
   console.log(`node_repl MCP: ${report.runtime.nodeReplMcp.exists ? "ok" : "missing"}`);
+  console.log(
+    `chromium extension: ${
+      report.chromiumExtension.captureVisibleTabPatch &&
+      report.chromiumExtension.captureVisibleTabMetadata &&
+      report.chromiumExtension.reloadVersionMarker
+        ? "ok"
+        : report.chromiumExtension.backgroundExists
+          ? "needs patch"
+          : "missing"
+    } ${report.chromiumExtension.backgroundPath}`
+  );
   for (const manifest of report.nativeHostManifests) {
     console.log(
       `manifest: ${manifest.pathMatches ? "ok" : manifest.exists ? "mismatch" : "missing"} ${manifest.path}`
@@ -1557,6 +1870,44 @@ function restorePlugin(args) {
   }
 }
 
+function patchExtensionCommand(args) {
+  requireLinuxWrites(args);
+  args.patchChromiumExtension = true;
+  preflightInstall(args);
+  patchChromiumExtension(args);
+}
+
+function restoreChromiumExtension(args) {
+  requireLinuxWrites(args);
+  const filePaths = [chromiumExtensionBackgroundPath(args), chromiumExtensionManifestPath(args)];
+  if (!filePaths.some((filePath) => fs.existsSync(path.dirname(filePath)))) return;
+  if (!args.dryRun && filePaths.some((filePath) => fs.existsSync(filePath) && !canWritePath(filePath))) {
+    requirePasswordlessSudo("Restoring the Chromium extension");
+  }
+  for (const filePath of filePaths) {
+    const backup = latestBackupForFile(filePath);
+    if (!backup) {
+      logAction(args, `no extension backup found for ${filePath}`);
+      continue;
+    }
+    const contents = fs.readFileSync(backup, "utf8");
+    writePossiblyPrivilegedFile(filePath, contents, 0o644, args);
+    logAction(args, `restored ${filePath} from ${backup}`);
+  }
+}
+
+function latestBackupForFile(filePath) {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  if (!fs.existsSync(dir)) return null;
+  const backups = fs
+    .readdirSync(dir)
+    .filter((name) => name.startsWith(`${base}${BACKUP_SUFFIX}`))
+    .sort();
+  const latest = backups.at(-1);
+  return latest ? path.join(dir, latest) : null;
+}
+
 function restoreBackupsInDirectory(dir, args) {
   if (!fs.existsSync(dir)) return;
   for (const entry of fs.readdirSync(dir)) {
@@ -1587,7 +1938,10 @@ function main() {
       requireLinuxWrites(args);
       patchPlugins(args);
     }
+    else if (args.command === "patch-extension") patchExtensionCommand(args);
+    else if (args.command === "reset-extension-cache") resetChromiumExtensionCache(args);
     else if (args.command === "restore-plugin") restorePlugin(args);
+    else if (args.command === "restore-extension") restoreChromiumExtension(args);
     else {
       usage();
       throw new Error(`Unknown command: ${args.command}`);

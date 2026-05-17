@@ -6,6 +6,7 @@
  * Chrome browser-client bootstrap to run on linux/arm64:
  *   - tool: js
  *   - tool: js_reset
+ *   - tool: browser_cleanup
  *   - globalThis.nodeRepl request metadata/helpers
  *   - globalThis.__codexNativePipe.createConnection(path)
  */
@@ -38,6 +39,16 @@ const RESET_ON_TIMEOUT = !/^(0|false|no)$/i.test(
 const RESET_ON_BROWSER_BRIDGE_ERROR = !/^(0|false|no)$/i.test(
   realProcess.env.CODEX_NODE_REPL_RESET_ON_BROWSER_BRIDGE_ERROR || ""
 );
+const CLEANUP_TABS_ON_RESET = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_NODE_REPL_CLEANUP_TABS_ON_RESET || ""
+);
+const CLEANUP_TABS_ON_EXIT = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_NODE_REPL_CLEANUP_TABS_ON_EXIT || ""
+);
+const BROWSER_CLEANUP_TIMEOUT_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS,
+  3000
+);
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
@@ -46,6 +57,7 @@ let lastEmittedImages = [];
 let imageCounter = 0;
 let queue = Promise.resolve();
 let endRequested = false;
+let shutdownStarted = false;
 let timeoutExitRequested = false;
 let consecutiveJsTimeouts = 0;
 
@@ -218,6 +230,47 @@ function disposeContextResources(targetContext = context, reason = "reset") {
   log("disposed context resources", `reason=${reason} native_connections=${count}`);
 }
 
+async function cleanupBrowserTabs(targetContext = context, reason = "cleanup") {
+  if (!targetContext) return { status: "skipped", reason: "no context" };
+  if (targetContext.__browserTabsFinalized) {
+    return { status: "skipped", reason: "browser tabs already finalized" };
+  }
+
+  const tabs = targetContext.browser?.tabs;
+  if (!tabs || typeof tabs.finalize !== "function") {
+    return { status: "skipped", reason: "browser.tabs.finalize unavailable" };
+  }
+
+  try {
+    await tabs.finalize.call(tabs, { keep: [] });
+    targetContext.__browserTabsFinalized = true;
+    log("browser tabs finalized", `reason=${reason}`);
+    return { status: "ok", reason };
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    log("browser tab cleanup failed", `reason=${reason} error=${JSON.stringify(message)}`);
+    return { status: "error", error: message };
+  }
+}
+
+async function cleanupBrowserTabsWithTimeout(targetContext = context, reason = "cleanup") {
+  try {
+    return await withTimeoutMs(
+      cleanupBrowserTabs(targetContext, reason),
+      BROWSER_CLEANUP_TIMEOUT_MS,
+      () => log("browser tab cleanup timed out", `reason=${reason}`),
+      () =>
+        new Error(
+          `browser cleanup timed out after ${BROWSER_CLEANUP_TIMEOUT_MS}ms while finalizing session tabs`
+        )
+    );
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    log("browser tab cleanup failed", `reason=${reason} error=${JSON.stringify(message)}`);
+    return { status: "error", error: message };
+  }
+}
+
 function resetContext() {
   disposeContextResources(context, "reset");
   fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
@@ -310,6 +363,7 @@ function resetContext() {
     require,
     savedImagePaths,
     __nativeConnections: nativeConnections,
+    __browserTabsFinalized: false,
     __state: state,
   };
   context.globalThis = context;
@@ -355,6 +409,7 @@ ${code}
   );
 
   const result = await fn(runContext, (specifier) => importFromCwd(specifier, runContext.nodeRepl.cwd));
+  if (codeRequestsBrowserFinalize(code)) runContext.__browserTabsFinalized = true;
   const content = [];
   const text = [];
   const images = runContext.emittedImages.slice();
@@ -388,6 +443,10 @@ function shouldReplayLastImagesAfterCleanup(code, result) {
     /browser\.tabs\.finalize\s*\(/.test(code) &&
     !/\b(display|emitImage)\s*\(/.test(code)
   );
+}
+
+function codeRequestsBrowserFinalize(code) {
+  return /browser\.tabs\.finalize\s*\(/.test(code);
 }
 
 class JsTimeoutError extends Error {
@@ -450,6 +509,16 @@ function exitCodeForEnd() {
   return timeoutExitRequested ? 124 : 0;
 }
 
+async function shutdown() {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  if (CLEANUP_TABS_ON_EXIT) {
+    await cleanupBrowserTabsWithTimeout(context, "stdin-end");
+  }
+  disposeContextResources(context, "stdin-end");
+  realProcess.exit(exitCodeForEnd());
+}
+
 const tools = [
   {
     name: "js",
@@ -469,7 +538,18 @@ const tools = [
   },
   {
     name: "js_reset",
-    description: "Reset the persistent Node.js REPL context.",
+    description:
+      "Reset the persistent Node.js REPL context. Also best-effort closes current Browser session tabs unless disabled.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "browser_cleanup",
+    description:
+      "Best-effort close/finalize tabs created by the current Browser Use session. Does not close arbitrary user tabs.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -511,6 +591,12 @@ function isBrowserBridgeStaleError(error) {
   );
 }
 
+function formatBrowserCleanupResult(result) {
+  if (result.status === "ok") return "browser tabs finalized";
+  if (result.status === "skipped") return `browser cleanup skipped: ${result.reason}`;
+  return `browser cleanup failed: ${result.error}`;
+}
+
 async function callTool(name, args = {}) {
   if (name === "js") {
     const timeoutMs = jsTimeoutFromArgs(args);
@@ -545,8 +631,17 @@ async function callTool(name, args = {}) {
   }
   if (name === "js_reset") {
     consecutiveJsTimeouts = 0;
+    const cleanupResult = CLEANUP_TABS_ON_RESET
+      ? await cleanupBrowserTabsWithTimeout(context, "js_reset")
+      : { status: "skipped", reason: "disabled" };
     resetContext();
-    return { content: [{ type: "text", text: "reset" }] };
+    return {
+      content: [{ type: "text", text: `reset; ${formatBrowserCleanupResult(cleanupResult)}` }],
+    };
+  }
+  if (name === "browser_cleanup") {
+    const cleanupResult = await cleanupBrowserTabsWithTimeout(context, "browser_cleanup");
+    return { content: [{ type: "text", text: formatBrowserCleanupResult(cleanupResult) }] };
   }
   throw new Error(`Unknown tool: ${name}`);
 }
@@ -603,7 +698,7 @@ STDIN.on("data", (chunk) => {
         .then(() => handleMessage(message))
         .catch((error) => log("queued request failed", error.stack || error.message))
         .finally(() => {
-          if (endRequested) realProcess.exit(exitCodeForEnd());
+          if (endRequested) queueMicrotask(() => shutdown());
         });
     } catch (error) {
       log("parse failed", error.stack || error.message);
@@ -613,7 +708,7 @@ STDIN.on("data", (chunk) => {
 
 STDIN.on("end", () => {
   endRequested = true;
-  queue.finally(() => realProcess.exit(exitCodeForEnd()));
+  queue.finally(() => shutdown());
 });
 realProcess.on("uncaughtException", (error) => {
   log("uncaught exception", error.stack || error.message);
@@ -623,5 +718,5 @@ realProcess.on("uncaughtException", (error) => {
 resetContext();
 log(
   "started",
-  `pid=${realProcess.pid} session_id=${SESSION_ID} turn_id=${TURN_ID} js_timeout_ms=${JS_TIMEOUT_MS}`
+  `pid=${realProcess.pid} session_id=${SESSION_ID} turn_id=${TURN_ID} js_timeout_ms=${JS_TIMEOUT_MS} browser_cleanup_timeout_ms=${BROWSER_CLEANUP_TIMEOUT_MS}`
 );

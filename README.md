@@ -14,7 +14,8 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
 
 - Installs a Linux native-messaging bridge for the official Codex Chrome
   extension.
-- Installs a minimal `node_repl` MCP server exposing `js` and `js_reset`.
+- Installs a minimal `node_repl` MCP server exposing `js`, `js_reset`, and
+  `browser_cleanup`.
 - Exposes `nodeRepl` and `__codexNativePipe` so the official
   `browser-client.mjs` can connect to Chromium through the native host.
 - Provides `nodeRepl.import()` and `__dynamicImport()` for relative imports
@@ -28,12 +29,23 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   screenshot capture and DOM snapshots, so Chromium-side hangs return a
   recoverable error instead of stalling the MCP call until the outer tool
   transport closes.
-- On Linux Chromium, uses a faster visible-viewport screenshot path that lets
-  Chromium capture the current viewport directly instead of first computing a
-  layout clip rectangle. Screenshot capture remains a supported first-class
-  operation.
+- On Linux Chromium, can patch the official extension with a non-CDP
+  `chrome.tabs.captureVisibleTab` endpoint. Normal visible-viewport screenshots
+  use that endpoint first, bypassing the `Page.captureScreenshot` debugger path
+  that can time out or detach on complex pages. Full-page and cropped
+  screenshots still use CDP.
+- Bumps the unpacked Chromium extension manifest version when applying that
+  patch, so Chromium re-registers the service worker instead of continuing to
+  run stale cached extension code.
+- Keeps a faster CDP visible-viewport fallback that lets Chromium capture the
+  current viewport directly instead of first computing a layout clip rectangle.
+  Screenshot capture remains a supported first-class operation.
 - Cleans up native browser sockets after a `js` timeout, so a timed-out browser
   command is less likely to poison follow-up tool calls in the same MCP process.
+- Exposes a dedicated `browser_cleanup` MCP tool that calls the official
+  Browser Use session finalizer with `keep: []`, so agents can close task tabs
+  without running arbitrary cleanup JavaScript. `js_reset` and normal MCP
+  process shutdown also best-effort run the same cleanup.
 - Restarts the native host bridge when a client disconnects with an in-flight
   browser command, which clears orphaned screenshot/DOM commands that can later
   surface as `Detached while handling command`.
@@ -107,7 +119,7 @@ Override it with `--extension-id` if your extension ID differs.
 From the project directory on the Linux host:
 
 ```bash
-node bin/codex-browser-use-linux-chromium.js install --desktop-shims --windows-shims
+node bin/codex-browser-use-linux-chromium.js install --patch-chromium-extension --desktop-shims --windows-shims
 node bin/codex-browser-use-linux-chromium.js doctor
 ```
 
@@ -128,6 +140,15 @@ node bin/codex-browser-use-linux-chromium.js doctor
   runtime. Chrome plugin roots use `node_repl`; Browser Use plugin roots use
   `browser_node_repl`. The installer also adds `mcpServers` metadata to Chrome
   and Browser Use plugin manifests when the official cache does not ship it.
+- With `--patch-chromium-extension`, patches the system Chromium Codex extension
+  background script under `/usr/share/chromium/extensions/codex` so viewport
+  screenshots can use `chrome.tabs.captureVisibleTab` instead of the debugger
+  `Page.captureScreenshot` path. Use `--extension-root PATH` when the extension
+  is installed elsewhere. Patched extension instances advertise this capability
+  through `getInfo()`, and the Browser client prefers those instances when old
+  unpatched sockets are still present. The installer also bumps the unpacked
+  extension version, for example from `1.1.4` to `1.1.4.1`, to force Chromium to
+  refresh the extension service worker.
 - Enables `features.tool_search_always_defer_mcp_tools = true` in
   `~/.codex/config.toml` so Codex 0.130+ exposes plugin MCP tools such as
   `node_repl/js` through `tool_search`. Pass `--skip-feature-config` only if
@@ -147,9 +168,9 @@ node bin/codex-browser-use-linux-chromium.js doctor
   - `/etc/chromium/native-messaging-hosts/com.openai.codexextension.json`
   - `/etc/opt/chrome/native-messaging-hosts/com.openai.codexextension.json`
 
-The `/Applications` shims and system native host manifests require root
-permissions. The installer preflights passwordless `sudo -n` before making
-changes when either privileged option is requested.
+The `/Applications` shims, system native host manifests, and system Chromium
+extension patch require root permissions. The installer preflights passwordless
+`sudo -n` before making changes when a privileged option is requested.
 
 For tests or custom Chromium profile locations, override the manifest root:
 
@@ -232,13 +253,21 @@ node bin/codex-browser-use-linux-chromium.js install --windows-shims \
 
 ## Restore Plugin Patches
 
-Plugin patches are backed up next to each patched file with a
+Plugin and extension patches are backed up next to each patched file with a
 `.codex-browser-use-linux-chromium.bak.<timestamp>` suffix.
 
 Restore the latest adjacent backups with:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js restore-plugin
+node bin/codex-browser-use-linux-chromium.js restore-extension
+```
+
+If Chromium keeps reporting the old extension metadata after a file patch, close
+Chromium and reset its service worker registration cache:
+
+```bash
+node bin/codex-browser-use-linux-chromium.js reset-extension-cache
 ```
 
 ## Debugging
@@ -279,15 +308,17 @@ explicitly want timeout errors to terminate the MCP process.
 The timeout error includes a `consecutive_js_timeouts` counter and recovery
 hint. `domSnapshot()` and screenshot capture are normal supported Browser Use
 features on Linux Chromium; the compatibility layer should not steer agents to
-silently avoid them. If lightweight calls such as `browser.tabs.list()`,
-`tab.url()`, and `tab.title()` still work while `domSnapshot`, screenshot,
-click, fill, or keyboard calls keep timing out, treat it as a page-level
-browser bridge hang. Run `js_reset`, re-bootstrap, create a new tab, navigate to
-the target URL again, and retry the requested evidence in a fresh single-purpose
-call. Do not recover by finding an existing tab with the same URL after a bridge
-reset; that tab may still be tied to an orphaned CDP command. If it still fails,
-report that page-level blocker instead of claiming the screenshot or DOM feature
-is unavailable.
+silently avoid them. With `--patch-chromium-extension`, normal viewport
+screenshots first use `chrome.tabs.captureVisibleTab`, so they no longer depend
+on `Page.captureScreenshot`. If lightweight calls such as `browser.tabs.list()`,
+`tab.url()`, and `tab.title()` still work while `domSnapshot`, full-page/cropped
+screenshot, click, fill, or keyboard calls keep timing out, treat it as a
+page-level browser bridge hang. Run `js_reset`, re-bootstrap, create a new tab,
+navigate to the target URL again, and retry the requested evidence in a fresh
+single-purpose call. Do not recover by finding an existing tab with the same URL
+after a bridge reset; that tab may still be tied to an orphaned CDP command. If
+it still fails, report that page-level blocker instead of claiming the screenshot
+or DOM feature is unavailable.
 
 On Linux Chromium, keep browser bridge calls short and single-purpose. Do not
 combine click/fill/keyboard/navigation with `domSnapshot()`, screenshots, dev
@@ -299,6 +330,19 @@ call fails with `native pipe is closed`, `Detached while handling command`, or
 `Timed out after ... waiting for CDP command`, the REPL resets its stale browser
 context by default; run `js_reset`, re-bootstrap, create a new tab, and navigate
 to the target URL again before retrying.
+
+If Chromium accumulates tabs from Browser/Chrome tasks, use the `browser_cleanup`
+MCP tool on the same `node_repl`/`browser_node_repl` server. It runs the Browser
+Use tab finalizer for the current session with `keep: []`; it does not close
+arbitrary user tabs. The runtime also best-effort runs that cleanup before
+`js_reset` and when the MCP process exits. If the same JS context already ran
+`browser.tabs.finalize(...)` directly, including a deliberate handoff or
+deliverable keep list, those automatic cleanup paths skip the second finalizer
+call. Set
+`CODEX_NODE_REPL_CLEANUP_TABS_ON_RESET=0` or
+`CODEX_NODE_REPL_CLEANUP_TABS_ON_EXIT=0` to disable those automatic cleanup
+paths, and tune the cleanup wait with
+`CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS` (default 3000).
 
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is
@@ -325,5 +369,12 @@ cleanup-after-screenshot ordering mistake.
 `doctor` also reports Browser Use sockets under `/tmp/codex-browser-use`.
 Sockets whose owner process is gone are stale; the native bridge removes stale
 `chromium-<pid>.sock` files on startup.
+
+`doctor` also reports whether the Chromium Codex extension background script and
+manifest reload marker have the visible-tab screenshot patch. Use
+`install --patch-chromium-extension` or `patch-extension` to apply it. If a live
+extension still omits `codexLinuxCaptureVisibleTab` from `getInfo()`, close
+Chromium and run `reset-extension-cache`, then reopen Chromium. Use
+`restore-extension` to restore the latest backup made by this installer.
 
 See [docs/architecture.md](docs/architecture.md) for the runtime flow.

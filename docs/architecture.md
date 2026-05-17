@@ -45,9 +45,11 @@ tool_search_always_defer_mcp_tools = true
 ```
 
 With that flag, `node_repl/js` and `node_repl/js_reset` stay discoverable
-through `tool_search` in new turns. `doctor` reports the flag separately from
-native-host and plugin-cache status so a missing JS tool is not misdiagnosed as
-a Chromium path problem.
+through `tool_search` in new turns. The same runtime also exposes
+`browser_cleanup`, a small tool that runs Browser Use tab finalization for the
+current session without requiring an arbitrary JavaScript cleanup cell. `doctor`
+reports the flag separately from native-host and plugin-cache status so a
+missing JS tool is not misdiagnosed as a Chromium path problem.
 
 Codex 0.130 also de-duplicates plugin MCP server names while loading plugin
 metadata. The official Chrome and Browser Use caches can both point at a server
@@ -157,14 +159,27 @@ requested timeout for page-level CDP calls such as `Page.captureScreenshot`.
 Those failures now return as bounded browser errors that can be reset and
 retried instead of waiting for the outer MCP transport to close.
 
-For visible screenshots, the installer also patches the Linux Chromium client
-path to call `Page.captureScreenshot` for the current viewport directly. The
+For visible screenshots, `install --patch-chromium-extension` patches the local
+Chromium Codex extension to expose a small `captureVisibleTab` RPC backed by
+`chrome.tabs.captureVisibleTab`. The Browser client then uses that non-CDP path
+first for normal viewport screenshots, which avoids the official extension's
+`chrome.debugger.sendCommand("Page.captureScreenshot")` timeout/detach behavior
+on complex pages. Patched extension instances also advertise a metadata flag in
+`getInfo()`, and the Browser client sorts those instances first during discovery
+so old unpatched sockets do not win selection while Chromium is being rolled.
+The extension manifest version is bumped during the same patch so Chromium has a
+new unpacked-extension version to register. If an existing profile still serves
+old service worker code, `reset-extension-cache` backs up the profile's
+`Service Worker` directory and lets Chromium rebuild the registration on the
+next launch.
+
+The installer also keeps a faster CDP fallback for visible screenshots. The
 official client normally asks `Page.getLayoutMetrics` for `cssVisualViewport`
 and `Runtime.evaluate("window.devicePixelRatio")`, then captures a clipped
 rectangle. That is valid, but on some Raspberry Pi or server Chromium sessions
 the clipped path can hang even when the page DOM is responsive. The Linux patch
 keeps screenshot support enabled while avoiding those extra CDP calls for normal
-viewport screenshots.
+viewport screenshots. Full-page and cropped screenshots still require CDP.
 
 The native host bridge also serializes writes to Chromium stdout and waits for
 Node's `drain` event when the Chrome native-messaging pipe reports backpressure.
@@ -186,13 +201,34 @@ After that reset, callers must create a new tab and navigate to the target URL
 again. Reusing an existing tab by URL can bind the new REPL context to a tab
 that still has an orphaned page-level command in flight.
 
+## Tab Lifecycle Cleanup
+
+The official Browser Use tab lifecycle is explicit: tabs opened for a session
+remain in Chromium until the caller runs `browser.tabs.finalize(...)`. That is
+easy to miss in long Codex tasks, especially when the agent only needed a page
+temporarily for verification.
+
+This compatibility runtime exposes `browser_cleanup` as a first-class MCP tool.
+It calls the current Browser Use session finalizer with `keep: []`, which closes
+tabs owned by the current session group and leaves unrelated user tabs alone.
+`js_reset` runs the same cleanup before replacing the REPL context, and normal
+MCP process shutdown runs it once more as a best-effort exit hook. These paths
+are bounded by `CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS` so cleanup cannot
+become another long-hanging browser command.
+
+The runtime also records when the JS context has already successfully requested
+`browser.tabs.finalize(...)`. That prevents the reset/exit hooks from running a
+second `keep: []` finalizer after a task deliberately kept a tab as a handoff or
+deliverable.
+
 ## Install Safety
 
 The installer plans all plugin script edits for a plugin root before writing any
 of them. If an official plugin update changes one required patch point, the
-plugin root is left untouched instead of being half patched. Desktop path shims
-and optional system native host manifests also have a sudo preflight before
-install writes begin.
+plugin root is left untouched instead of being half patched. Desktop path shims,
+optional system native host manifests, and the optional Chromium extension
+background/manifest patch also have a sudo preflight before install writes
+begin.
 
 ## Socket Cleanup
 
