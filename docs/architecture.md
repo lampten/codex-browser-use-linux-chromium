@@ -29,7 +29,7 @@ The project intentionally does not implement browser automation as a separate
 replacement API. It only recreates enough of the official Node REPL runtime for
 the official Browser Use client code to run.
 
-## Codex 0.130 Tool Discovery
+## Codex 0.130+ Tool Discovery
 
 Codex 0.130 changed MCP tool exposure so small sets of non-app MCP tools can be
 registered directly instead of being listed in `tool_search`. That is valid for
@@ -74,6 +74,14 @@ turns may also load a staged bundled-marketplace copy under
 `~/.codex/.tmp/bundled-marketplaces/<marketplace>/plugins/...`. Both copies
 need the same MCP metadata and skill patches; otherwise a restarted app-server
 can still build a turn from the unpatched staged copy.
+
+Codex 0.131 keeps these two constraints in place and adds official CLI
+diagnostics. This project treats `codex doctor --json`, `codex mcp list`, and
+`codex plugin list` as useful upstream evidence, but not as replacements for the
+bridge-specific checks. The upstream doctor can prove the active Codex install,
+config parser, update state, and effective MCP registry; only this project's
+doctor can verify the Chromium extension patch, native host manifests, live
+Browser Use sockets, and local plugin-cache rewrites.
 
 ## Browser vs Chrome Routing
 

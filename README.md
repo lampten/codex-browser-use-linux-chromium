@@ -61,6 +61,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   entry instead of depending on a global or stale MCP entry. Chrome keeps the
   official `node_repl` name; Browser Use is renamed to `browser_node_repl` to
   avoid Codex's duplicate plugin MCP server-name de-duplication.
+- Layers Codex CLI 0.131+ diagnostics into this project's `doctor`: it reads
+  `codex doctor --json`, `codex mcp list`, and `codex plugin list` to verify the
+  effective CLI install, MCP registry, and Browser/Chrome plugin state alongside
+  the Chromium/native-host checks that the upstream doctor does not know about.
 - On Linux, patches the official `Browser` / `browser-use` skill to keep the
   `@browser` entrypoint but select the Chromium-backed `extension` backend.
   Linux remote hosts do not have the Codex Desktop `iab` browser, and treating
@@ -209,6 +213,13 @@ The patched Chrome skill is deliberately stricter: Chrome tasks should use
 in-app-browser compatibility and can lead a Chrome request down Browser-specific
 routing instructions.
 
+Codex 0.131 keeps the same compatibility requirements. The official CLI now has
+`codex doctor`, `codex mcp list`, and `codex plugin list`; this project shells
+out to those commands from `doctor` and reports the upstream status as additional
+evidence. A failing upstream terminal check such as `TERM=dumb` does not by
+itself mean the Chromium bridge is broken; use this project's native-host,
+extension, socket, and plugin-cache checks for the browser-specific path.
+
 For direct Codex CLI usage, also add:
 
 ```bash
@@ -280,12 +291,16 @@ Useful logs on the Linux host:
 ~/.codex/logs_2.sqlite
 ```
 
-If a fresh Codex Desktop conversation cannot see `mcp__node_repl__js`, search
+If a fresh Codex Desktop conversation cannot see `mcp__node_repl__js`, run
+`node bin/codex-browser-use-linux-chromium.js doctor` first. The output now
+includes the upstream Codex version, official `codex mcp list` entries for
+`node_repl` and `browser_node_repl`, and the Browser/Chrome plugin install
+state. If those look correct, search
 `logs_2.sqlite` for `RefreshMcpServers` and verify the exact `node_repl.command`
 exists on the Linux host. Also search the logs for `skipping duplicate plugin
 MCP server name`: if Chrome and Browser Use both declare `node_repl`, reinstall
 this compatibility layer so Browser Use is moved to `browser_node_repl`, then
-restart `codex app-server`. On Codex 0.130 remote hosts, verify both
+restart `codex app-server`. On Codex 0.130+ remote hosts, verify both
 `~/.codex/plugins/cache/...` and
 `~/.codex/.tmp/bundled-marketplaces/openai-bundled/plugins/...`; the staged
 bundled-marketplace copy is what some Desktop remote turns load.
@@ -375,9 +390,10 @@ attachment links. The REPL also replays the most recent emitted image when a
 follow-up `js` call only finalizes browser tabs, covering the common
 cleanup-after-screenshot ordering mistake.
 
-`doctor` also reports Browser Use sockets under `/tmp/codex-browser-use`.
-Sockets whose owner process is gone are stale; the native bridge removes stale
-`chromium-<pid>.sock` files on startup.
+`doctor` also reports Browser Use sockets under `/tmp/codex-browser-use`, plus
+the current upstream Codex CLI doctor/MCP/plugin-list summaries when `codex` is
+available on PATH. Sockets whose owner process is gone are stale; the native
+bridge removes stale `chromium-<pid>.sock` files on startup.
 
 `doctor` also reports whether the Chromium Codex extension background script and
 manifest reload marker have the visible-tab screenshot patch. Use

@@ -199,6 +199,38 @@ function commandPath(command) {
   }
 }
 
+function runCapturedCommand(command, commandArgs, timeoutMs = 15000) {
+  const result = childProcess.spawnSync(command, commandArgs, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
+  });
+  return {
+    command: [command, ...commandArgs],
+    ok: result.status === 0,
+    status: result.status == null ? null : result.status,
+    signal: result.signal || null,
+    timedOut: Boolean(result.error && result.error.code === "ETIMEDOUT"),
+    error: result.error ? result.error.message : null,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+  };
+}
+
+function trimCommandOutput(value, maxLength = 4000) {
+  const text = String(value || "").trim();
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}\n... truncated ${text.length - maxLength} chars`;
+}
+
+function parseJsonOutput(text) {
+  try {
+    return { value: JSON.parse(text), error: null };
+  } catch (error) {
+    return { value: null, error: error.message };
+  }
+}
+
 function processExists(pid) {
   try {
     process.kill(pid, 0);
@@ -293,6 +325,160 @@ function runtimePaths(args) {
     nativeHostBridge: path.join(args.installRoot, "native-host", "codex-native-host-bridge.js"),
     nodeReplMcp: path.join(args.installRoot, "node-repl", "codex-node-repl-mcp.js"),
   };
+}
+
+function codexDoctorCheckStatus(report, id) {
+  return report && report.checks && report.checks[id] ? report.checks[id].status || null : null;
+}
+
+function summarizeCodexDoctor(commandResult) {
+  const parsed = parseJsonOutput(commandResult.stdout);
+  const report = parsed.value;
+  const failedChecks =
+    report && report.checks
+      ? Object.values(report.checks)
+          .filter((check) => check && check.status && check.status !== "ok")
+          .map((check) => ({
+            id: check.id || null,
+            status: check.status,
+            summary: check.summary || null,
+          }))
+      : [];
+
+  return {
+    command: commandResult.command,
+    processOk: commandResult.ok,
+    status: commandResult.status,
+    signal: commandResult.signal,
+    timedOut: commandResult.timedOut,
+    error: commandResult.error,
+    stderr: trimCommandOutput(commandResult.stderr),
+    parseError: parsed.error,
+    overallStatus: report ? report.overallStatus || null : null,
+    codexVersion: report ? report.codexVersion || null : null,
+    checks: {
+      configLoad: codexDoctorCheckStatus(report, "config.load"),
+      installation: codexDoctorCheckStatus(report, "installation"),
+      mcpConfig: codexDoctorCheckStatus(report, "mcp.config"),
+      runtimeProvenance: codexDoctorCheckStatus(report, "runtime.provenance"),
+      terminalEnv: codexDoctorCheckStatus(report, "terminal.env"),
+      updatesStatus: codexDoctorCheckStatus(report, "updates.status"),
+    },
+    failedChecks,
+  };
+}
+
+function parseCodexMcpList(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .slice(1)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split(/\s{2,}/);
+      return {
+        name: parts[0] || null,
+        command: parts[1] === "-" ? null : parts[1] || null,
+        args: parts[2] === "-" || !parts[2] ? [] : [parts[2]],
+        env: parts[3] === "-" ? null : parts[3] || null,
+        cwd: parts[4] === "-" ? null : parts[4] || null,
+        status: parts[5] || null,
+        auth: parts.slice(6).join(" ") || null,
+      };
+    })
+    .filter((server) => server.name);
+}
+
+function summarizeCodexMcpList(commandResult, paths) {
+  const servers = commandResult.ok ? parseCodexMcpList(commandResult.stdout) : [];
+  const byName = new Map(servers.map((server) => [server.name, server]));
+  const requiredServers = ["node_repl", "browser_node_repl"].map((name) => {
+    const server = byName.get(name) || null;
+    const firstArg = server && server.args.length > 0 ? server.args[0] : null;
+    return {
+      name,
+      present: Boolean(server),
+      enabled: server ? server.status === "enabled" : false,
+      command: server ? server.command : null,
+      firstArg,
+      pathMatches: firstArg != null && path.resolve(firstArg) === path.resolve(paths.nodeReplMcp),
+    };
+  });
+
+  return {
+    command: commandResult.command,
+    ok: commandResult.ok,
+    status: commandResult.status,
+    signal: commandResult.signal,
+    timedOut: commandResult.timedOut,
+    error: commandResult.error,
+    stderr: trimCommandOutput(commandResult.stderr),
+    servers,
+    requiredServers,
+  };
+}
+
+function parseCodexPluginList(text) {
+  const entries = [];
+  let marketplace = null;
+  let marketplacePath = null;
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const marketplaceMatch = line.match(/^Marketplace `([^`]+)`$/);
+    if (marketplaceMatch) {
+      marketplace = marketplaceMatch[1];
+      marketplacePath = null;
+      continue;
+    }
+
+    const pathMatch = line.match(/^Path: (.+)$/);
+    if (pathMatch) {
+      marketplacePath = pathMatch[1];
+      continue;
+    }
+
+    const pluginMatch = line.match(/^\s{2}(\S+) \(([^)]+)\)$/);
+    if (pluginMatch) {
+      entries.push({
+        id: pluginMatch[1],
+        marketplace,
+        marketplacePath,
+        states: pluginMatch[2].split(",").map((state) => state.trim()),
+      });
+    }
+  }
+  return entries;
+}
+
+function summarizeCodexPluginList(commandResult) {
+  const entries = commandResult.ok ? parseCodexPluginList(commandResult.stdout) : [];
+  const relevantPlugins = entries.filter((entry) =>
+    ["browser-use@openai-bundled", "chrome@openai-bundled"].includes(entry.id)
+  );
+  return {
+    command: commandResult.command,
+    ok: commandResult.ok,
+    status: commandResult.status,
+    signal: commandResult.signal,
+    timedOut: commandResult.timedOut,
+    error: commandResult.error,
+    stderr: trimCommandOutput(commandResult.stderr),
+    relevantPlugins,
+  };
+}
+
+function upstreamCodexStatus(codexPath, paths) {
+  const status = {
+    available: Boolean(codexPath),
+    doctor: null,
+    mcpList: null,
+    pluginList: null,
+  };
+  if (!codexPath) return status;
+
+  status.doctor = summarizeCodexDoctor(runCapturedCommand(codexPath, ["doctor", "--json"], 20000));
+  status.mcpList = summarizeCodexMcpList(runCapturedCommand(codexPath, ["mcp", "list"], 10000), paths);
+  status.pluginList = summarizeCodexPluginList(runCapturedCommand(codexPath, ["plugin", "list"], 10000));
+  return status;
 }
 
 function resolveCodexPath() {
@@ -1728,6 +1914,7 @@ function chromiumExtensionStatus(args) {
 function doctor(args) {
   const paths = runtimePaths(args);
   const pluginRoots = detectPluginRoots(args);
+  const codexPath = resolveCodexPath();
   const configPath = path.join(args.codexHome, "config.toml");
   const configText = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
   const nodeReplConfig = findTomlTable(configText, "mcp_servers.node_repl");
@@ -1742,8 +1929,9 @@ function doctor(args) {
       chromium: commandPath("chromium"),
       chromiumBrowser: commandPath("chromium-browser"),
       googleChrome: commandPath("google-chrome"),
-      codex: resolveCodexPath(),
+      codex: codexPath,
     },
+    upstreamCodex: upstreamCodexStatus(codexPath, paths),
     codexHome: args.codexHome,
     installRoot: args.installRoot,
     browserConfigRoot: args.browserConfigRoot,
@@ -1786,6 +1974,31 @@ function doctor(args) {
   console.log(`node: ${report.node.version} ${report.node.execPath}`);
   console.log(`chromium: ${report.commands.chromium || report.commands.chromiumBrowser || "not found"}`);
   console.log(`codex: ${report.commands.codex || "not found"}`);
+  if (report.upstreamCodex.doctor) {
+    const upstreamDoctor = report.upstreamCodex.doctor;
+    const checks = upstreamDoctor.checks || {};
+    console.log(
+      `codex doctor: ${upstreamDoctor.overallStatus || "unknown"} version=${upstreamDoctor.codexVersion || "unknown"} config=${checks.configLoad || "unknown"} mcp=${checks.mcpConfig || "unknown"} terminal=${checks.terminalEnv || "unknown"}`
+    );
+  }
+  if (report.upstreamCodex.mcpList) {
+    for (const server of report.upstreamCodex.mcpList.requiredServers) {
+      console.log(
+        `codex mcp ${server.name}: ${
+          server.present && server.enabled && server.pathMatches
+            ? "ok"
+            : server.present
+              ? "mismatch"
+              : "missing"
+        } ${server.firstArg || ""}`.trim()
+      );
+    }
+  }
+  if (report.upstreamCodex.pluginList) {
+    for (const plugin of report.upstreamCodex.pluginList.relevantPlugins) {
+      console.log(`codex plugin ${plugin.id}: ${plugin.states.join(", ")}`);
+    }
+  }
   console.log(`install root: ${report.installRoot}`);
   console.log(`browser config root: ${report.browserConfigRoot}`);
   console.log(
