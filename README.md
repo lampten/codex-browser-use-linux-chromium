@@ -358,6 +358,12 @@ native host bridge exits by default so Chromium restarts it with a clean command
 pipe. This prevents orphaned screenshot or DOM commands from causing later
 `Detached while handling command` failures. Set
 `CODEX_NATIVE_HOST_EXIT_ON_ORPHANED_PENDING=0` to preserve the old behavior.
+The bridge only rewrites JSON-RPC request ids while multiplexing clients; it
+passes JSON-RPC responses through unchanged. This is required because the
+Chromium extension sends heartbeat requests to the browser client. If response
+ids are rewritten, the extension never observes the heartbeat response, assumes
+the client is gone, and detaches active browser sessions while page commands
+such as `domSnapshot()` or locator reads are still running.
 
 If a screenshot task says it succeeded but no image appears in the final
 assistant message, check whether the final message references

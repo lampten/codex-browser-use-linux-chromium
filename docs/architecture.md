@@ -133,6 +133,15 @@ conversations share browser-session state. Changing `turn_id` between adjacent
 `js` calls in the same assistant turn can also make a tab created by one call
 look detached to the next call.
 
+The native host bridge multiplexes local MCP clients onto Chromium's single
+native-messaging pipe by rewriting JSON-RPC request ids. It must not rewrite
+JSON-RPC responses. The Chromium extension sends its own requests, including
+heartbeat pings, back to the browser client; rewriting those response ids leaves
+the extension waiting forever. Once the heartbeat times out, the extension stops
+active sessions and detaches debugger targets, which can surface as repeated
+`domSnapshot()`, locator, click, or fill timeouts even though the requested page
+operation was otherwise valid.
+
 The `js` tool also has a process-level timeout controlled by
 `CODEX_NODE_REPL_JS_TIMEOUT_MS` and defaults to 100000 ms. When a JavaScript
 call times out, the MCP server returns a normal tool result with `isError: true`

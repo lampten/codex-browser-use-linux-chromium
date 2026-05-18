@@ -96,6 +96,14 @@ function hasId(message) {
   return message && Object.prototype.hasOwnProperty.call(message, "id");
 }
 
+function isJsonRpcRequest(message) {
+  return hasId(message) && typeof message.method === "string";
+}
+
+function isJsonRpcResponse(message) {
+  return hasId(message) && typeof message.method !== "string";
+}
+
 function logStdoutBackpressure() {
   stdoutBackpressureEvents += 1;
   const now = Date.now();
@@ -194,18 +202,21 @@ function cleanupStaleSockets() {
 }
 
 function forwardClientMessage(client, message) {
-  if (hasId(message)) {
+  if (isJsonRpcRequest(message)) {
     const bridgeId = `codex-bridge:${client.id}:${String(message.id)}`;
     pendingRequests.set(bridgeId, { client, originalId: message.id });
     enqueueChromeWrite({ ...message, id: bridgeId }, client, bridgeId);
     return;
   }
 
+  // Responses answer extension-originated requests and must keep the original
+  // id. Rewriting them leaves the extension waiting forever and its heartbeat
+  // eventually detaches active browser sessions.
   enqueueChromeWrite(message, client);
 }
 
 function forwardChromeMessage(message) {
-  if (hasId(message)) {
+  if (isJsonRpcResponse(message)) {
     const key = String(message.id);
     const pending = pendingRequests.get(key);
     if (pending) {
