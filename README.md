@@ -18,6 +18,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   `browser_cleanup`.
 - Exposes `nodeRepl` and `__codexNativePipe` so the official
   `browser-client.mjs` can connect to Chromium through the native host.
+- Exposes `nodeRepl.ensureChromiumExtensionReady()`, which opens the patched
+  Chromium profile when a fresh Codex conversation reaches Browser setup before
+  any extension-backed browser session is online. It waits for the extension's
+  native-host socket before the Browser skill retries `agent.browsers.get`.
 - Provides `nodeRepl.import()` and `__dynamicImport()` for relative imports
   resolved from the REPL cwd.
 - Saves emitted browser images to absolute files under the current workspace
@@ -68,7 +72,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
 - On Linux, patches the official `Browser` / `browser-use` skill to keep the
   `@browser` entrypoint but select the Chromium-backed `extension` backend.
   Linux remote hosts do not have the Codex Desktop `iab` browser, and treating
-  the extension as `iab` is not equivalent for screenshot-heavy flows.
+  the extension as `iab` is not equivalent for screenshot-heavy flows. The
+  patched bootstrap also asks the local runtime to start Chromium when the
+  extension backend is missing, so a new conversation does not have to remember
+  a manual browser-open step.
 - Optionally installs macOS Desktop remote path shims under `/Applications/...`
   on the Linux host. This is needed when Codex Desktop on macOS remotely
   connects to the Linux host and sends its own `node_repl` path through

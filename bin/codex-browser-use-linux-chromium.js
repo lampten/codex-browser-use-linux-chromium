@@ -327,6 +327,16 @@ function runtimePaths(args) {
   };
 }
 
+function runtimeFileStatus(filePath, markers = []) {
+  const exists = fs.existsSync(filePath);
+  const text = exists ? fs.readFileSync(filePath, "utf8") : "";
+  return {
+    path: filePath,
+    exists,
+    markers: Object.fromEntries(markers.map((marker) => [marker, text.includes(marker)])),
+  };
+}
+
 function codexDoctorCheckStatus(report, id) {
   return report && report.checks && report.checks[id] ? report.checks[id].status || null : null;
 }
@@ -688,6 +698,7 @@ function patchBrowserClient(text) {
   output = patchBrowserClientVisibleScreenshotLazyDpr(output);
   output = patchBrowserClientExtensionVisibleScreenshots(output);
   output = patchBrowserClientPreferExtensionVisibleScreenshots(output);
+  output = patchBrowserClientExtensionNavigateResult(output);
   output = patchBrowserClientInputPasteFallback(output);
   return output;
 }
@@ -801,8 +812,12 @@ const BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-extension-visible-screenshots";
 const BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-prefer-extension-visible-screenshots";
+const BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-extension-navigate-result";
 const BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-input-paste-fallback";
+const NODE_REPL_CHROMIUM_AUTOSTART_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-extension-autostart";
 
 function patchBrowserClientFastVisibleScreenshots(text) {
   if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
@@ -879,6 +894,25 @@ function patchBrowserClientPreferExtensionVisibleScreenshots(text) {
   return `/* ${BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
 }
 
+function patchBrowserClientExtensionNavigateResult(text) {
+  if (text.includes(BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER)) return text;
+
+  let output = replaceRequired(
+    text,
+    'function dc(t){if(typeof t=="string")try{return new URL(t).href}catch{return t}}',
+    'function codexLinuxNavigationResultUrl(t){let e=t?.tab;return dc(e?.pendingUrl??e?.url)}function codexLinuxNavigationResultMatches(t,e,r){let n=codexLinuxNavigationResultUrl(t);return n!=null&&(r!=null&&n===r||e!=null&&n!==e)}function dc(t){if(typeof t=="string")try{return new URL(t).href}catch{return t}}',
+    "Browser client extension navigation result helper"
+  );
+  output = replaceRequired(
+    output,
+    'let f=await d;if("error"in f)throw f.error;or(f.event)',
+    'if(e.clientInfo?.type==="extension"&&codexLinuxNavigationResultMatches(p,i,s))return{};let f=await d;if("error"in f)throw f.error;or(f.event)',
+    "Browser client extension navigation result short-circuit"
+  );
+
+  return `/* ${BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER} */\n${output}`;
+}
+
 function patchBrowserClientInputPasteFallback(text) {
   if (text.includes(BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER)) return text;
 
@@ -924,6 +958,16 @@ const CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER =
   "codex-browser-use-linux-chromium: extension-capture-visible-tab";
 const CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER =
   "codex-browser-use-linux-chromium: extension-capture-visible-tab-metadata";
+const CHROMIUM_EXTENSION_PAGE_NAVIGATE_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-page-navigate-tabs-update";
+const CHROMIUM_EXTENSION_PAGE_NAVIGATE_GLOBAL_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-page-navigate-global-tabs-update";
+const CHROMIUM_EXTENSION_PAGE_NAVIGATE_DETACH_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-page-navigate-detach-before-tabs-update";
+const CHROMIUM_EXTENSION_PAGE_NAVIGATE_FOCUS_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-page-navigate-focus-active-tab";
+const CHROMIUM_EXTENSION_PAGE_NAVIGATE_KEEP_DEBUGGER_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-page-navigate-keep-debugger-events";
 const CHROMIUM_EXTENSION_VERSION_NAME_MARKER = "codex-browser-use-linux-chromium";
 
 function chromiumExtensionBackgroundPath(args) {
@@ -952,6 +996,74 @@ function patchChromiumExtensionBackground(text) {
     output = `/* ${CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_PATCH_MARKER} */\n${output}`;
   }
 
+  if (!output.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async captureVisibleTab(e)',
+      'async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await chrome.tabs.update(t,{url:e.commandParams.url});return{}}try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async captureVisibleTab(e)',
+      "Chromium extension Page.navigate tabs.update fallback"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_PAGE_NAVIGATE_PATCH_MARKER} */\n${output}`;
+  }
+
+  if (!output.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_GLOBAL_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'function gt(e){return e.method==="Target.getTargets"?chrome.debugger.getTargets().then(t=>({targetInfos:t})):chrome.debugger.sendCommand(e.target,e.method,e.commandParams)}async function mt(e)',
+      'function gt(e){if(e.method==="Page.navigate"&&typeof e.target?.tabId==="number"&&typeof e.commandParams?.url==="string")return chrome.tabs.update(e.target.tabId,{url:e.commandParams.url}).then(()=>({}));return e.method==="Target.getTargets"?chrome.debugger.getTargets().then(t=>({targetInfos:t})):chrome.debugger.sendCommand(e.target,e.method,e.commandParams)}async function mt(e)',
+      "Chromium extension global Page.navigate tabs.update fallback"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_PAGE_NAVIGATE_GLOBAL_PATCH_MARKER} */\n${output}`;
+  }
+
+  if (!output.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_DETACH_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await chrome.tabs.update(t,{url:e.commandParams.url});return{}}try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async captureVisibleTab(e)',
+      'async executeCdp(e){const t=e.target.tabId;if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await this.requireSessionTab(t);G.has(t)&&await ze(t);await chrome.tabs.update(t,{url:e.commandParams.url});return{}}if(typeof t=="number"&&(await this.requireSessionTab(t),!G.has(t)))throw new Error("Debugger unattached");try{return await mt(e)}catch(s){throw bt(s)&&typeof t=="number"&&await ze(t),s}}async captureVisibleTab(e)',
+      "Chromium extension Page.navigate detach-before-tabs.update fallback"
+    );
+    output = replaceRequired(
+      output,
+      'function gt(e){if(e.method==="Page.navigate"&&typeof e.target?.tabId==="number"&&typeof e.commandParams?.url==="string")return chrome.tabs.update(e.target.tabId,{url:e.commandParams.url}).then(()=>({}));return e.method==="Target.getTargets"?chrome.debugger.getTargets().then(t=>({targetInfos:t})):chrome.debugger.sendCommand(e.target,e.method,e.commandParams)}async function mt(e)',
+      'function gt(e){if(e.method==="Page.navigate"&&typeof e.target?.tabId==="number"&&typeof e.commandParams?.url==="string")return(async()=>{const t=e.target.tabId;G.has(t)&&await ze(t);await chrome.tabs.update(t,{url:e.commandParams.url});return{}})();return e.method==="Target.getTargets"?chrome.debugger.getTargets().then(t=>({targetInfos:t})):chrome.debugger.sendCommand(e.target,e.method,e.commandParams)}async function mt(e)',
+      "Chromium extension global Page.navigate detach-before-tabs.update fallback"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_PAGE_NAVIGATE_DETACH_PATCH_MARKER} */\n${output}`;
+  }
+
+  if (!output.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_FOCUS_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await this.requireSessionTab(t);G.has(t)&&await ze(t);await chrome.tabs.update(t,{url:e.commandParams.url});return{}}if(typeof t=="number"',
+      'if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await this.requireSessionTab(t);G.has(t)&&await ze(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}}if(typeof t=="number"',
+      "Chromium extension Page.navigate focus active tab fallback"
+    );
+    output = replaceRequired(
+      output,
+      'return(async()=>{const t=e.target.tabId;G.has(t)&&await ze(t);await chrome.tabs.update(t,{url:e.commandParams.url});return{}})();return e.method==="Target.getTargets"',
+      'return(async()=>{const t=e.target.tabId;G.has(t)&&await ze(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}})();return e.method==="Target.getTargets"',
+      "Chromium extension global Page.navigate focus active tab fallback"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_PAGE_NAVIGATE_FOCUS_PATCH_MARKER} */\n${output}`;
+  }
+
+  if (!output.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_KEEP_DEBUGGER_PATCH_MARKER)) {
+    output = replaceRequired(
+      output,
+      'if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await this.requireSessionTab(t);G.has(t)&&await ze(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}}if(typeof t=="number"',
+      'if(e.method==="Page.navigate"&&typeof t=="number"&&typeof e.commandParams?.url==="string"){await this.requireSessionTab(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}}if(typeof t=="number"',
+      "Chromium extension Page.navigate keeps debugger attached for events"
+    );
+    output = replaceRequired(
+      output,
+      'return(async()=>{const t=e.target.tabId;G.has(t)&&await ze(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}})();return e.method==="Target.getTargets"',
+      'return(async()=>{const t=e.target.tabId;const s=await chrome.tabs.get(t);typeof s.windowId=="number"&&await chrome.windows.update(s.windowId,{focused:!0}).catch(()=>{});const r=await chrome.tabs.update(t,{active:!0,url:e.commandParams.url});return{tab:{id:r.id,title:r.title,active:r.active,url:r.url,pendingUrl:r.pendingUrl}}})();return e.method==="Target.getTargets"',
+      "Chromium extension global Page.navigate keeps debugger attached for events"
+    );
+    output = `/* ${CHROMIUM_EXTENSION_PAGE_NAVIGATE_KEEP_DEBUGGER_PATCH_MARKER} */\n${output}`;
+  }
+
   if (!output.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER)) {
     output = replaceRequired(
       output,
@@ -972,7 +1084,7 @@ function bumpChromiumExtensionVersion(version) {
   const parts = version.split(".").map((part) => Number(part));
   if (parts.length < 4) return `${version}.1`;
   if (parts[3] === 0) return `${parts.slice(0, 3).join(".")}.1`;
-  return version;
+  return `${parts.slice(0, 3).join(".")}.${parts[3] + 1}`;
 }
 
 function patchChromiumExtensionManifest(text) {
@@ -1143,6 +1255,10 @@ const BROWSER_SKILL_TIMEOUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-timeout-recovery";
 const BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-command-scoping";
+const BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-skill-chromium-autostart";
+const BROWSER_SKILL_UNIFIED_BOOTSTRAP_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-skill-unified-bootstrap";
 const CHROME_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-node-repl-discovery";
 const CHROME_SKILL_TIMEOUT_PATCH_MARKER =
@@ -1160,7 +1276,15 @@ function patchBrowserSkill(text) {
     text.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER) &&
     text.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
+    text.includes(BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER) &&
+    text.includes(BROWSER_SKILL_UNIFIED_BOOTSTRAP_PATCH_MARKER) &&
     text.includes('agent.browsers.get("extension")') &&
+    text.includes("ensureChromiumExtensionReady") &&
+    text.includes("setupCodexBrowserUseRuntime") &&
+    text.includes("ensureCodexBrowserUseRuntimeReady") &&
+    text.includes("delete globalThis.agent") &&
+    text.includes("Do not use the shorter generic setup cell on this Linux-patched host") &&
+    !text.includes('globalThis.browser = await agent.browsers.get("extension")') &&
     text.includes('do not use `agent.browsers.get("iab")` on this host') &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
@@ -1188,18 +1312,45 @@ function patchBrowserSkill(text) {
 <!-- ${BROWSER_SKILL_NODE_REPL_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_TIMEOUT_PATCH_MARKER} -->
 <!-- ${BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER} -->
+<!-- ${BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER} -->
+<!-- ${BROWSER_SKILL_UNIFIED_BOOTSTRAP_PATCH_MARKER} -->
 
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, keep using the Browser plugin entrypoint, but select the Chromium-backed extension backend with \`agent.browsers.get("extension")\`. Linux remote hosts do not have a Codex Desktop in-app browser, so do not use \`agent.browsers.get("iab")\` on this host and do not fall back to shell Playwright solely because there is no desktop app browser surface on Linux.
 
-This Linux section overrides the generic Bootstrap examples below when they say to select \`iab\`. Use this first Browser cell on Linux:
+This Linux section overrides all generic Bootstrap examples below. Do not use the shorter generic setup cell on this Linux-patched host. Use this first Browser cell on Linux. It asks the local runtime to open the patched Chromium profile before backend discovery, then retries if \`agent.browsers.get("extension")\` still reports that the extension backend is unavailable.
 
 \`\`\`js
-if (!globalThis.agent) {
+async function setupCodexBrowserUseRuntime() {
   const { setupAtlasRuntime } = await import("<plugin root>/scripts/browser-client.mjs");
   await setupAtlasRuntime({ globals: globalThis });
 }
+async function ensureCodexBrowserUseRuntimeReady() {
+  if (globalThis.nodeRepl?.ensureChromiumExtensionReady) {
+    await globalThis.nodeRepl.ensureChromiumExtensionReady({ timeoutMs: 10000 });
+  }
+  delete globalThis.agent;
+  await setupCodexBrowserUseRuntime();
+}
+if (!globalThis.agent) {
+  await ensureCodexBrowserUseRuntimeReady();
+}
 if (!globalThis.browser) {
-  globalThis.browser = await agent.browsers.get("extension");
+  try {
+    globalThis.browser = await globalThis.agent.browsers.get("extension");
+  } catch (error) {
+    if (
+      globalThis.nodeRepl?.ensureChromiumExtensionReady &&
+      /Browser is not available: extension/.test(error?.message || String(error))
+    ) {
+      await globalThis.nodeRepl.ensureChromiumExtensionReady({ force: true, timeoutMs: 10000 });
+      delete globalThis.agent;
+      delete globalThis.browser;
+      await ensureCodexBrowserUseRuntimeReady();
+      globalThis.browser = await globalThis.agent.browsers.get("extension");
+    } else {
+      throw error;
+    }
+  }
 }
 await browser.nameSession("short task name");
 if (typeof tab === "undefined") {
@@ -1223,6 +1374,62 @@ Do not run a lightweight tab check after a timeout/reset. Calls such as \`tab.ur
 
 `;
   output = output.replace(bootstrapHeader, `${section}## Bootstrap`);
+  const linuxBrowserBootstrapPrefix = `async function setupCodexBrowserUseRuntime() {
+  const { setupAtlasRuntime } = await import("<plugin root>/scripts/browser-client.mjs");
+  await setupAtlasRuntime({ globals: globalThis });
+}
+async function ensureCodexBrowserUseRuntimeReady() {
+  if (globalThis.nodeRepl?.ensureChromiumExtensionReady) {
+    await globalThis.nodeRepl.ensureChromiumExtensionReady({ timeoutMs: 10000 });
+  }
+  delete globalThis.agent;
+  await setupCodexBrowserUseRuntime();
+}
+if (!globalThis.agent) {
+  await ensureCodexBrowserUseRuntimeReady();
+}
+if (!globalThis.browser) {
+  try {
+    globalThis.browser = await globalThis.agent.browsers.get("extension");
+  } catch (error) {
+    if (
+      globalThis.nodeRepl?.ensureChromiumExtensionReady &&
+      /Browser is not available: extension/.test(error?.message || String(error))
+    ) {
+      await globalThis.nodeRepl.ensureChromiumExtensionReady({ force: true, timeoutMs: 10000 });
+      delete globalThis.agent;
+      delete globalThis.browser;
+      await ensureCodexBrowserUseRuntimeReady();
+      globalThis.browser = await globalThis.agent.browsers.get("extension");
+    } else {
+      throw error;
+    }
+  }
+}`;
+  const legacyBootstrapPrefix = `if (!globalThis.agent) {
+  const { setupAtlasRuntime } = await import("<plugin root>/scripts/browser-client.mjs");
+  await setupAtlasRuntime({ globals: globalThis });
+}
+if (!globalThis.browser) {
+  globalThis.browser = await agent.browsers.get("extension");
+}`;
+  output = output.split(legacyBootstrapPrefix).join(linuxBrowserBootstrapPrefix);
+  output = output.replace(
+    /const \{ setupAtlasRuntime \} = await import\("<plugin root>\/scripts\/browser-client\.mjs"\);\r?\nawait setupAtlasRuntime\(\{ globals: globalThis \}\);\r?\nglobalThis\.browser = await agent\.browsers\.get\("extension"\);/g,
+    linuxBrowserBootstrapPrefix
+  );
+  output = output.replace(
+    /if \(!globalThis\.agent\) \{\r?\n  const \{ setupAtlasRuntime \} = await import\("<plugin root>\/scripts\/browser-client\.mjs"\);\r?\n  await setupAtlasRuntime\(\{ globals: globalThis \}\);\r?\n\}\r?\nif \(!globalThis\.browser\) \{\r?\n  globalThis\.browser = await agent\.browsers\.get\("extension"\);\r?\n\}/g,
+    linuxBrowserBootstrapPrefix
+  );
+  output = output.replace(
+    "Run this once per fresh `node_repl` session:",
+    "On this Linux-patched host, run the guarded setup cell with `ensureChromiumExtensionReady` once per fresh `node_repl` session:"
+  );
+  output = output.replace(
+    "* Before interacting with the browser via `node_repl`, first set up the runtime using the guarded first-browser-cell pattern below.",
+    "* Before interacting with the browser via `node_repl`, first set up the runtime using the guarded Linux first-browser-cell pattern below; do not use a shorter setup cell that omits `ensureChromiumExtensionReady`."
+  );
   output = output.replace(/agent\.browsers\.get\("iab"\)/g, 'agent.browsers.get("extension")');
   output = output.replace(/agent\.browsers\.get\('iab'\)/g, "agent.browsers.get('extension')");
   output = output.replace(
@@ -1815,6 +2022,9 @@ function patchStatusForRoot(root, paths) {
     browserClientPrefersExtensionVisibleScreenshots:
       browserClient.includes(BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER) &&
       browserClient.includes("codexLinuxCaptureVisibleTab===!0"),
+    browserClientExtensionNavigateResult:
+      browserClient.includes(BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER) &&
+      browserClient.includes("codexLinuxNavigationResultMatches"),
     browserClientInputPasteFallback:
       browserClient.includes(BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER) &&
       browserClient.includes('["text","search","url","tel","password"]'),
@@ -1834,6 +2044,12 @@ function patchStatusForRoot(root, paths) {
       browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
       browserSkillTimeoutRecovery: browserSkill.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER),
       browserSkillCommandScoping: browserSkill.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER),
+      browserSkillChromiumAutostart:
+        browserSkill.includes(BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER) &&
+        browserSkill.includes("ensureChromiumExtensionReady"),
+      browserSkillUnifiedBootstrap:
+        browserSkill.includes(BROWSER_SKILL_UNIFIED_BOOTSTRAP_PATCH_MARKER) &&
+        browserSkill.includes("ensureCodexBrowserUseRuntimeReady"),
       browserUsePluginDeclaresMcpServers: pluginJson.includes('"mcpServers": "./.mcp.json"'),
     };
   }
@@ -1914,6 +2130,30 @@ function chromiumExtensionStatus(args) {
     captureVisibleTabMetadata:
       backgroundText.includes(CHROMIUM_EXTENSION_CAPTURE_VISIBLE_TAB_METADATA_PATCH_MARKER) &&
       backgroundText.includes("codexLinuxCaptureVisibleTab:!0"),
+    pageNavigateTabsUpdate:
+      backgroundText.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_PATCH_MARKER) &&
+      backgroundText.includes('e.method==="Page.navigate"') &&
+      backgroundText.includes("chrome.tabs.update"),
+    pageNavigateGlobalTabsUpdate:
+      backgroundText.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_GLOBAL_PATCH_MARKER) &&
+      backgroundText.includes('function gt(e){if(e.method==="Page.navigate"') &&
+      backgroundText.includes("chrome.tabs.update"),
+    pageNavigateDetachBeforeTabsUpdate:
+      backgroundText.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_DETACH_PATCH_MARKER) &&
+      backgroundText.includes("G.has(t)&&await ze(t)") &&
+      backgroundText.includes("chrome.tabs.update"),
+    pageNavigateFocusActiveTab:
+      backgroundText.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_FOCUS_PATCH_MARKER) &&
+      backgroundText.includes("chrome.windows.update") &&
+      backgroundText.includes("pendingUrl"),
+    pageNavigateKeepsDebuggerEvents:
+      backgroundText.includes(CHROMIUM_EXTENSION_PAGE_NAVIGATE_KEEP_DEBUGGER_PATCH_MARKER) &&
+      backgroundText.includes(
+        'await this.requireSessionTab(t);const s=await chrome.tabs.get(t);typeof s.windowId=="number"'
+      ) &&
+      backgroundText.includes(
+        'return(async()=>{const t=e.target.tabId;const s=await chrome.tabs.get(t);typeof s.windowId=="number"'
+      ),
   };
   if (status.manifestExists) {
     try {
@@ -1961,7 +2201,7 @@ function doctor(args) {
     },
     runtime: {
       nativeHostBridge: { path: paths.nativeHostBridge, exists: fs.existsSync(paths.nativeHostBridge) },
-      nodeReplMcp: { path: paths.nodeReplMcp, exists: fs.existsSync(paths.nodeReplMcp) },
+      nodeReplMcp: runtimeFileStatus(paths.nodeReplMcp, [NODE_REPL_CHROMIUM_AUTOSTART_MARKER]),
     },
     nativeHostManifests: userNativeManifestPaths(args).map((manifestPath) =>
       nativeManifestStatus(manifestPath, paths.nativeHostBridge)
@@ -2035,7 +2275,13 @@ function doctor(args) {
     } ${report.codexConfig.path}`
   );
   console.log(`native host bridge: ${report.runtime.nativeHostBridge.exists ? "ok" : "missing"}`);
-  console.log(`node_repl MCP: ${report.runtime.nodeReplMcp.exists ? "ok" : "missing"}`);
+  console.log(
+    `node_repl MCP: ${
+      report.runtime.nodeReplMcp.exists ? "ok" : "missing"
+    } chromium_autostart=${
+      report.runtime.nodeReplMcp.markers[NODE_REPL_CHROMIUM_AUTOSTART_MARKER] ? "ok" : "missing"
+    }`
+  );
   console.log(
     `chromium extension: ${
       report.chromiumExtension.captureVisibleTabPatch &&

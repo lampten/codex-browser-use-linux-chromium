@@ -12,10 +12,12 @@
  */
 
 const fs = require("node:fs");
+const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const realProcess = require("node:process");
+const childProcess = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { pathToFileURL } = require("node:url");
 
@@ -25,6 +27,34 @@ const LOG_PATH = realProcess.env.CODEX_NODE_REPL_MCP_LOG || "/tmp/codex-node-rep
 const DEFAULT_CWD = realProcess.env.CODEX_NODE_REPL_CWD || realProcess.cwd();
 const TMP_DIR = realProcess.env.CODEX_NODE_REPL_TMPDIR || path.join(os.tmpdir(), "codex-node-repl-mcp");
 const ARTIFACT_DIR = realProcess.env.CODEX_NODE_REPL_ARTIFACT_DIR || DEFAULT_CWD;
+const NODE_REPL_CHROMIUM_AUTOSTART_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-extension-autostart";
+const NODE_REPL_CHROMIUM_NAVIGATION_PREFLIGHT_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-http-navigation-preflight";
+const BROWSER_USE_SOCKET_DIR =
+  realProcess.env.CODEX_BROWSER_USE_SOCKET_DIR || path.join(os.tmpdir(), "codex-browser-use");
+const CHROMIUM_USER_DATA_DIR =
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_USER_DATA_DIR ||
+  path.join(os.homedir(), ".config", "chromium");
+const CHROMIUM_PROFILE_DIRECTORY = realProcess.env.CODEX_BROWSER_USE_CHROMIUM_PROFILE || "";
+const CHROMIUM_EXTENSION_READY_TIMEOUT_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_READY_TIMEOUT_MS,
+  6000
+);
+const CHROMIUM_EXTENSION_READY_POLL_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_READY_POLL_MS,
+  250
+);
+const CHROMIUM_EXTENSION_AUTOSTART = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_AUTOSTART || ""
+);
+const CHROMIUM_NAVIGATION_PREFLIGHT = !/^(0|false|no)$/i.test(
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_NAVIGATION_PREFLIGHT || ""
+);
+const CHROMIUM_NAVIGATION_PREFLIGHT_TIMEOUT_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_NAVIGATION_PREFLIGHT_TIMEOUT_MS,
+  7000
+);
 const SESSION_ID =
   realProcess.env.CODEX_NODE_REPL_SESSION_ID ||
   `node-repl-mcp-${os.hostname()}-${realProcess.pid}-${randomUUID()}`;
@@ -98,6 +128,403 @@ function parseNonNegativeInt(value, fallback) {
   if (value == null || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : fallback;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function commandPath(command) {
+  const pathValue = realProcess.env.PATH || "";
+  for (const dir of pathValue.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, command);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep searching PATH.
+    }
+  }
+  return null;
+}
+
+function readJsonFileIfPresent(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function userSystemdEnvironment() {
+  const env = {};
+  try {
+    const result = childProcess.spawnSync("systemctl", ["--user", "show-environment"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    });
+    if (result.status === 0) {
+      for (const line of String(result.stdout || "").split(/\r?\n/)) {
+        const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+        if (!match) continue;
+        if (
+          [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+          ].includes(match[1])
+        ) {
+          env[match[1]] = match[2];
+        }
+      }
+    }
+  } catch {
+    // Fall through to filesystem-derived defaults below.
+  }
+
+  const uid = typeof realProcess.getuid === "function" ? realProcess.getuid() : os.userInfo().uid;
+  const runtimeDir = env.XDG_RUNTIME_DIR || (uid != null ? `/run/user/${uid}` : "");
+  if (runtimeDir && fs.existsSync(runtimeDir)) {
+    env.XDG_RUNTIME_DIR = runtimeDir;
+    if (!env.DBUS_SESSION_BUS_ADDRESS && fs.existsSync(path.join(runtimeDir, "bus"))) {
+      env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${path.join(runtimeDir, "bus")}`;
+    }
+    if (!env.WAYLAND_DISPLAY && fs.existsSync(path.join(runtimeDir, "wayland-0"))) {
+      env.WAYLAND_DISPLAY = "wayland-0";
+      env.XDG_SESSION_TYPE = env.XDG_SESSION_TYPE || "wayland";
+    }
+  }
+  if (!env.DISPLAY && fs.existsSync("/tmp/.X11-unix/X0")) env.DISPLAY = ":0";
+  return env;
+}
+
+function processState(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const afterCommand = stat.slice(stat.lastIndexOf(")") + 2);
+    return afterCommand.split(/\s+/)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function processExists(pid) {
+  try {
+    realProcess.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
+  }
+}
+
+function processIsLiveNonZombie(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || !processExists(pid)) return false;
+  return processState(pid) !== "Z";
+}
+
+function chromiumSingletonPidFromTarget(target) {
+  const match = String(target || "").match(/-(\d+)$/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function chromiumProfileDirectoryExists(profileDirectory) {
+  return fs.existsSync(path.join(CHROMIUM_USER_DATA_DIR, profileDirectory, "Preferences"));
+}
+
+function resolveChromiumProfileDirectory() {
+  if (CHROMIUM_PROFILE_DIRECTORY && chromiumProfileDirectoryExists(CHROMIUM_PROFILE_DIRECTORY)) {
+    return CHROMIUM_PROFILE_DIRECTORY;
+  }
+
+  const localState = readJsonFileIfPresent(path.join(CHROMIUM_USER_DATA_DIR, "Local State"));
+  const lastUsed = localState?.profile?.last_used;
+  if (typeof lastUsed === "string" && chromiumProfileDirectoryExists(lastUsed)) return lastUsed;
+
+  const activeProfiles = localState?.profile?.last_active_profiles;
+  if (Array.isArray(activeProfiles)) {
+    const usable = activeProfiles.filter(
+      (profile) => typeof profile === "string" && chromiumProfileDirectoryExists(profile)
+    );
+    if (usable.length > 0) return usable.at(-1);
+  }
+
+  if (chromiumProfileDirectoryExists("Default")) return "Default";
+  return "Default";
+}
+
+function liveBrowserUseSockets() {
+  if (!fs.existsSync(BROWSER_USE_SOCKET_DIR)) return [];
+  return fs
+    .readdirSync(BROWSER_USE_SOCKET_DIR)
+    .filter((entry) => /^chromium-\d+\.sock$/.test(entry))
+    .map((entry) => {
+      const socketPath = path.join(BROWSER_USE_SOCKET_DIR, entry);
+      const pid = Number(entry.match(/^chromium-(\d+)\.sock$/)[1]);
+      let isSocket = false;
+      try {
+        isSocket = fs.statSync(socketPath).isSocket();
+      } catch {
+        // Ignore races while the extension starts or exits.
+      }
+      return { path: socketPath, pid, isSocket, ownerProcessAlive: processIsLiveNonZombie(pid) };
+    })
+    .filter((socket) => socket.isSocket && socket.ownerProcessAlive);
+}
+
+function cleanupStaleChromiumProfileLocks() {
+  const lockPath = path.join(CHROMIUM_USER_DATA_DIR, "SingletonLock");
+  if (!fs.existsSync(lockPath)) return [];
+
+  let target;
+  try {
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return [];
+  }
+
+  const pid = chromiumSingletonPidFromTarget(target);
+  if (pid != null && processIsLiveNonZombie(pid)) return [];
+
+  const removed = [];
+  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    const filePath = path.join(CHROMIUM_USER_DATA_DIR, name);
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.rmSync(filePath, { force: true });
+        removed.push(filePath);
+      }
+    } catch (error) {
+      log("chromium stale profile lock cleanup failed", `${filePath} ${error.message}`);
+    }
+  }
+
+  if (removed.length > 0) {
+    log("chromium stale profile locks removed", `pid=${pid || "unknown"} files=${removed.length}`);
+  }
+  return removed;
+}
+
+function launchChromiumForExtension() {
+  const command =
+    realProcess.env.CODEX_BROWSER_USE_CHROMIUM_COMMAND ||
+    commandPath("chromium") ||
+    commandPath("chromium-browser");
+  if (!command) throw new Error("Could not find chromium or chromium-browser on PATH");
+
+  const profileDirectory = resolveChromiumProfileDirectory();
+  const args = [`--profile-directory=${profileDirectory}`, "--new-window", "about:blank"];
+  const child = childProcess.spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+    env: { ...realProcess.env, ...userSystemdEnvironment() },
+  });
+  child.unref();
+  log("chromium launch requested", `pid=${child.pid || "unknown"} command=${command} profile=${profileDirectory}`);
+  return { command, args, pid: child.pid || null, profileDirectory };
+}
+
+async function waitForBrowserUseSocket(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const sockets = liveBrowserUseSockets();
+    if (sockets.length > 0) return sockets;
+    if (Date.now() >= deadline) return [];
+    await sleep(CHROMIUM_EXTENSION_READY_POLL_MS);
+  }
+}
+
+async function ensureChromiumExtensionReady(options = {}) {
+  const existingSockets = liveBrowserUseSockets();
+  if (existingSockets.length > 0) {
+    return { status: "ready", launched: false, sockets: existingSockets };
+  }
+
+  if (!CHROMIUM_EXTENSION_AUTOSTART && options.force !== true) {
+    return { status: "disabled", launched: false, sockets: [] };
+  }
+
+  const removedProfileLocks = cleanupStaleChromiumProfileLocks();
+  let launch;
+  try {
+    launch = launchChromiumForExtension();
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    log("chromium launch failed", message);
+    return {
+      status: "launch-failed",
+      launched: false,
+      error: message,
+      removedProfileLocks,
+      sockets: [],
+    };
+  }
+
+  const timeoutMs = parseNonNegativeInt(options.timeoutMs, CHROMIUM_EXTENSION_READY_TIMEOUT_MS);
+  const sockets = await waitForBrowserUseSocket(timeoutMs);
+  return {
+    status: sockets.length > 0 ? "ready" : "not-ready",
+    launched: true,
+    launch,
+    removedProfileLocks,
+    sockets,
+  };
+}
+
+async function createNavigationProbeServer() {
+  const token = randomUUID();
+  const requests = [];
+  const server = http.createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url, at: new Date().toISOString() });
+    response.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-codex-navigation-probe": token,
+    });
+    response.end(
+      `<!doctype html><meta charset="utf-8"><title>codex navigation probe</title><body data-codex-navigation-probe="${token}">ok ${token}</body>`
+    );
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  const address = server.address();
+  if (!address || typeof address !== "object") {
+    await closeNavigationProbeServer(server);
+    throw new Error("Navigation probe server did not expose a TCP address");
+  }
+
+  return {
+    server,
+    token,
+    requests,
+    url: `http://127.0.0.1:${address.port}/codex-navigation-probe-${token}.html`,
+  };
+}
+
+function closeNavigationProbeServer(server) {
+  return new Promise((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function navigationPreflightFailureMessage(result) {
+  const requests = Array.isArray(result?.requests) ? result.requests.length : 0;
+  const phase = result?.phase || "unknown";
+  const detail = result?.error ? ` error=${result.error}` : "";
+  return `Chromium extension backend navigation preflight failed during ${phase}: minimal local HTTP page did not commit through the Browser extension backend within ${result?.timeoutMs || "unknown"}ms; requests_seen=${requests}; url=${result?.url || "unknown"}.${detail} Stop using the Linux Browser QA path for this task and use a known-good browser runtime instead.`;
+}
+
+async function checkChromiumNavigationReady(options = {}) {
+  if (!CHROMIUM_NAVIGATION_PREFLIGHT && options.force !== true) {
+    return { status: "disabled", reason: "CODEX_BROWSER_USE_CHROMIUM_NAVIGATION_PREFLIGHT=0" };
+  }
+
+  const browser = options.browser;
+  if (!browser || !browser.tabs || typeof browser.tabs.new !== "function") {
+    return { status: "unavailable", phase: "browser", error: "browser.tabs.new is unavailable" };
+  }
+
+  const timeoutMs = parseNonNegativeInt(
+    options.timeoutMs,
+    CHROMIUM_NAVIGATION_PREFLIGHT_TIMEOUT_MS
+  );
+  const closeTimeoutMs = Math.min(1000, Math.max(250, timeoutMs));
+  const startedAt = Date.now();
+  const probe = await createNavigationProbeServer();
+  let tab = null;
+  let phase = "create-tab";
+
+  try {
+    tab = await withTimeoutMs(
+      browser.tabs.new(),
+      timeoutMs,
+      () => log("chromium navigation preflight tab creation timed out", `timeout_ms=${timeoutMs}`),
+      () => new Error(`timed out creating Browser tab after ${timeoutMs}ms`)
+    );
+
+    phase = "navigate";
+    await withTimeoutMs(
+      tab.goto(probe.url),
+      timeoutMs,
+      () => {
+        disposeContextResources(context, "chromium-navigation-preflight-timeout");
+        log(
+          "chromium navigation preflight navigate timed out",
+          `timeout_ms=${timeoutMs} url=${probe.url} requests=${probe.requests.length}`
+        );
+      },
+      () => new Error(`timed out waiting for minimal HTTP navigation to commit after ${timeoutMs}ms`)
+    );
+
+    phase = "url";
+    const currentUrl = await withTimeoutMs(
+      tab.url(),
+      Math.min(2000, timeoutMs),
+      () => log("chromium navigation preflight url check timed out", `url=${probe.url}`),
+      () => new Error("timed out reading Browser tab URL after navigation")
+    );
+
+    const result = {
+      status: "ok",
+      phase: "complete",
+      url: probe.url,
+      currentUrl,
+      requests: probe.requests.slice(),
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs,
+    };
+    log("chromium navigation preflight ok", JSON.stringify(result));
+    return result;
+  } catch (error) {
+    const result = {
+      status: "failed",
+      phase,
+      url: probe.url,
+      requests: probe.requests.slice(),
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs,
+      error: error && error.message ? error.message : String(error),
+    };
+    log("chromium navigation preflight failed", JSON.stringify(result));
+    return result;
+  } finally {
+    if (tab && typeof tab.close === "function") {
+      await withTimeoutMs(
+        tab.close(),
+        closeTimeoutMs,
+        () => log("chromium navigation preflight tab close timed out", `timeout_ms=${closeTimeoutMs}`),
+        () => new Error("timed out closing navigation preflight tab")
+      ).catch((error) =>
+        log(
+          "chromium navigation preflight tab close failed",
+          error && error.message ? error.message : String(error)
+        )
+      );
+    }
+    await closeNavigationProbeServer(probe.server);
+  }
+}
+
+async function assertChromiumNavigationReady(options = {}) {
+  const result = await checkChromiumNavigationReady(options);
+  if (result.status !== "ok" && result.status !== "disabled") {
+    throw new Error(navigationPreflightFailureMessage(result));
+  }
+  return result;
 }
 
 // MCP uses stdout for JSON-RPC framing. Any user code or imported module that
@@ -323,6 +750,14 @@ function resetContext() {
     },
     async createElicitation() {
       return { action: "accept", allowed: true };
+    },
+    async ensureChromiumExtensionReady(options) {
+      const result = await ensureChromiumExtensionReady(options);
+      this.lastChromiumExtensionReady = result;
+      return result;
+    },
+    async openChromiumWithExtension(options) {
+      return this.ensureChromiumExtensionReady(options);
     },
   };
   globalThis.nodeRepl = nodeRepl;
