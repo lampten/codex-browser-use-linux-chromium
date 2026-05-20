@@ -688,6 +688,7 @@ function patchBrowserClient(text) {
   output = patchBrowserClientVisibleScreenshotLazyDpr(output);
   output = patchBrowserClientExtensionVisibleScreenshots(output);
   output = patchBrowserClientPreferExtensionVisibleScreenshots(output);
+  output = patchBrowserClientInputPasteFallback(output);
   return output;
 }
 
@@ -800,6 +801,8 @@ const BROWSER_CLIENT_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-extension-visible-screenshots";
 const BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-prefer-extension-visible-screenshots";
+const BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-input-paste-fallback";
 
 function patchBrowserClientFastVisibleScreenshots(text) {
   if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
@@ -874,6 +877,19 @@ function patchBrowserClientPreferExtensionVisibleScreenshots(text) {
   );
 
   return `/* ${BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER} */\n${output}`;
+}
+
+function patchBrowserClientInputPasteFallback(text) {
+  if (text.includes(BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER)) return text;
+
+  const output = replaceRequired(
+    text,
+    'if(w instanceof T.HTMLTextAreaElement||w instanceof T.HTMLInputElement){if(v.length===0)return;let R=w.selectionStart??w.value.length,L=w.selectionEnd??w.value.length;w.setRangeText(v,R,L,"end"),w.dispatchEvent(new T.InputEvent("input",{bubbles:!0}));return}',
+    'if(w instanceof T.HTMLTextAreaElement||w instanceof T.HTMLInputElement){if(v.length===0)return;if(w instanceof T.HTMLInputElement&&!["text","search","url","tel","password"].includes((w.type||"").toLowerCase())){try{w.value=v}catch{return}w.dispatchEvent(new T.InputEvent("input",{bubbles:!0,inputType:"insertFromPaste",data:v}));w.dispatchEvent(new T.Event("change",{bubbles:!0}));return}try{let R=w.selectionStart??w.value.length,L=w.selectionEnd??w.value.length;w.setRangeText(v,R,L,"end")}catch{w.value=v}w.dispatchEvent(new T.InputEvent("input",{bubbles:!0,inputType:"insertFromPaste",data:v}));return}',
+    "Browser client input paste fallback"
+  );
+
+  return `/* ${BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER} */\n${output}`;
 }
 
 const BROWSER_USE_EXTENSION_BACKEND_MARKER =
@@ -1799,6 +1815,9 @@ function patchStatusForRoot(root, paths) {
     browserClientPrefersExtensionVisibleScreenshots:
       browserClient.includes(BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER) &&
       browserClient.includes("codexLinuxCaptureVisibleTab===!0"),
+    browserClientInputPasteFallback:
+      browserClient.includes(BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER) &&
+      browserClient.includes('["text","search","url","tel","password"]'),
   };
   if (kind !== "chrome") {
     const browserSkill = read("skills/browser/SKILL.md");
