@@ -11,9 +11,13 @@ sees `mcp__node_repl__js`.
 
 The exact missing path depends on the desktop client. macOS usually sends
 `/Applications/Codex.app/Contents/Resources/node_repl` or the Beta app variant.
-Windows can send a path such as
-`C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe`.
-The installer can create Linux-side shims for both families.
+Windows can send a stable install path such as
+`C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe`, or a
+Codex 0.133-style hashed app binary path such as
+`C:\Users\Josh\AppData\Local\OpenAI\Codex\bin\3c238e29bbc930ff\node_repl.exe`.
+The installer can create Linux-side shims for these families, and it discovers
+hashed Windows paths from `~/.codex/logs_2.sqlite` after the app-server has seen
+one in `RefreshMcpServers`.
 
 This project fills the Linux side:
 
@@ -37,15 +41,18 @@ normal MCP usage, but it is brittle for this compatibility layer because the
 official Chrome and Browser skills first discover `node_repl/js` through the
 searchable tool surface.
 
-The installer therefore enables:
+The installer manages the flag by Codex version:
 
 ```toml
 [features]
-tool_search_always_defer_mcp_tools = true
+tool_search_always_defer_mcp_tools = false
 ```
 
-With that flag, `node_repl/js` and `node_repl/js_reset` stay discoverable
-through `tool_search` in new turns. The same runtime also exposes
+On Codex 0.133+, `false` keeps small MCP tool sets directly visible, which
+avoids Desktop remote sessions where `node_repl` starts successfully but the
+remote `tool_search` index omits it. On Codex 0.130-0.132, the installer keeps
+the older `true` setting because those versions needed `node_repl/js` and
+`node_repl/js_reset` to be discoverable through `tool_search`. The same runtime also exposes
 `browser_cleanup`, a small tool that runs Browser Use tab finalization for the
 current session without requiring an arbitrary JavaScript cleanup cell. `doctor`
 reports the flag separately from native-host and plugin-cache status so a
@@ -164,6 +171,14 @@ The `js` tool also has a process-level timeout controlled by
 call times out, the MCP server returns a normal tool result with `isError: true`
 rather than a JSON-RPC transport error, so the same Codex turn can still read
 the recovery instruction and run calls such as `js_reset`.
+
+Tab list calls and controllable tab handles are deliberately different surfaces.
+`browser.tabs.list()` and `browser.user.openTabs()` return serializable info
+objects for selection and inspection. Browser actions such as `goto()`,
+`url()`, `title()`, Playwright, CUA, and `close()` require a real `Tab` returned
+by `browser.tabs.new()`, `browser.tabs.selected()`, `browser.tabs.get(info.id)`,
+or `browser.user.claimTab(info)`.
+
 After a timeout, the compatibility runtime destroys native browser pipe sockets
 and resets the JS context by default; this prevents the timed-out Browser Use
 promise from continuing to occupy the extension channel while later calls run.
@@ -259,9 +274,9 @@ deliverable.
 The installer plans all plugin script edits for a plugin root before writing any
 of them. If an official plugin update changes one required patch point, the
 plugin root is left untouched instead of being half patched. Desktop path shims,
-optional system native host manifests, and the optional Chromium extension
-background/manifest patch also have a sudo preflight before install writes
-begin.
+including log-discovered Windows hash-bin commands, optional system native host
+manifests, and the optional Chromium extension background/manifest patch also
+have a sudo preflight before install writes begin.
 
 ## Socket Cleanup
 

@@ -14,6 +14,7 @@ const DEFAULT_CHROMIUM_EXTENSION_ROOT = "/usr/share/chromium/extensions/codex";
 const DEFAULT_SOCKET_DIR = "/tmp/codex-browser-use";
 const BACKUP_SUFFIX = ".codex-browser-use-linux-chromium.bak.";
 const TOOL_SEARCH_DEFER_FEATURE = "tool_search_always_defer_mcp_tools";
+const TOOL_SEARCH_DIRECT_MCP_CODEX_MIN_VERSION = "0.133.0";
 const DESKTOP_SHIM_DIRS = [
   "/Applications/Codex.app/Contents/Resources",
   "/Applications/Codex (Beta).app/Contents/Resources",
@@ -26,6 +27,8 @@ const WINDOWS_DESKTOP_APP_DIRS = [
   "OpenAI Codex Beta",
 ];
 const WINDOWS_NODE_REPL_NAMES = ["node_repl.exe", "node_repl"];
+const WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE =
+  /C:\\+Users\\+[^"\\]+\\+AppData\\+Local\\+OpenAI\\+(?:Codex|Codex Beta)\\+bin\\+[0-9a-fA-F]+\\+node_repl(?:\.exe)?/g;
 
 function usage() {
   console.log(`Usage:
@@ -433,6 +436,7 @@ function parseCodexPluginList(text) {
   let marketplace = null;
   let marketplacePath = null;
   for (const line of String(text || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
     const marketplaceMatch = line.match(/^Marketplace `([^`]+)`$/);
     if (marketplaceMatch) {
       marketplace = marketplaceMatch[1];
@@ -446,6 +450,11 @@ function parseCodexPluginList(text) {
       continue;
     }
 
+    if (marketplace && trimmed.startsWith("/") && !trimmed.includes("@")) {
+      marketplacePath = trimmed;
+      continue;
+    }
+
     const pluginMatch = line.match(/^\s{2}(\S+) \(([^)]+)\)$/);
     if (pluginMatch) {
       entries.push({
@@ -454,9 +463,54 @@ function parseCodexPluginList(text) {
         marketplacePath,
         states: pluginMatch[2].split(",").map((state) => state.trim()),
       });
+      continue;
+    }
+
+    if (!trimmed || /^PLUGIN\s+STATUS\s+VERSION\s+PATH$/.test(trimmed)) {
+      continue;
+    }
+
+    const tablePluginMatch = trimmed.match(/^(\S+@\S+)\s+(.+)$/);
+    if (tablePluginMatch) {
+      const [, id, rest] = tablePluginMatch;
+      const pathColumnMatch = rest.match(/\s+((?:\/|[A-Za-z]:[\\/]).*)$/);
+      const beforePath = pathColumnMatch ? rest.slice(0, pathColumnMatch.index).trim() : rest.trim();
+      const status = parseCodexPluginTableStatus(beforePath);
+      entries.push({
+        id,
+        marketplace,
+        marketplacePath,
+        states: status.states,
+        version: status.version,
+        path: pathColumnMatch ? pathColumnMatch[1] : null,
+      });
     }
   }
   return entries;
+}
+
+function parseCodexPluginTableStatus(text) {
+  for (const statusText of ["installed, enabled", "installed, disabled", "not installed"]) {
+    if (text === statusText) {
+      return {
+        states: statusText.split(",").map((state) => state.trim()),
+        version: null,
+      };
+    }
+    if (text.startsWith(`${statusText} `)) {
+      return {
+        states: statusText.split(",").map((state) => state.trim()),
+        version: text.slice(statusText.length).trim() || null,
+      };
+    }
+  }
+
+  const parts = text.split(/\s{2,}/).filter(Boolean);
+  const statusText = parts[0] || text;
+  return {
+    states: statusText.split(",").map((state) => state.trim()).filter(Boolean),
+    version: parts[1] || null,
+  };
 }
 
 function summarizeCodexPluginList(commandResult) {
@@ -476,6 +530,179 @@ function summarizeCodexPluginList(commandResult) {
   };
 }
 
+function pluginMarketplaceForRoot(root) {
+  for (const marketplace of ["openai-bundled", "openai-bundled-beta"]) {
+    if (root.includes(`${path.sep}${marketplace}${path.sep}`)) return marketplace;
+  }
+  return "openai-bundled";
+}
+
+function pluginIdForRoot(root, kind) {
+  const pluginName = kind === "chrome" ? "chrome" : "browser-use";
+  return `${pluginName}@${pluginMarketplaceForRoot(root)}`;
+}
+
+function pluginRootSource(root, entry) {
+  const resolvedRoot = path.resolve(root);
+  if (entry?.path && path.resolve(entry.path) === resolvedRoot) {
+    return entry.states.includes("installed") ? "active marketplace path" : "available marketplace path";
+  }
+  if (root.includes(`${path.sep}.tmp${path.sep}bundled-marketplaces${path.sep}`)) {
+    return "staged marketplace path";
+  }
+  if (root.includes(`${path.sep}plugins${path.sep}cache${path.sep}`)) return "cache path";
+  return "explicit path";
+}
+
+function pluginInstallInfoForRoot(root, kind, pluginList) {
+  const id = pluginIdForRoot(root, kind);
+  const entry = pluginList?.relevantPlugins?.find((plugin) => plugin.id === id) || null;
+  return {
+    id,
+    states: entry?.states || [],
+    version: entry?.version || null,
+    listedPath: entry?.path || null,
+    source: pluginRootSource(root, entry),
+  };
+}
+
+function formatPluginInstallInfo(info) {
+  const state = info.states.length > 0 ? info.states.join(", ") : "unknown install state";
+  const version = info.version ? ` ${info.version}` : "";
+  return `${info.id}: ${state}${version}; ${info.source}`;
+}
+
+function currentCodexPluginList() {
+  const codexPath = resolveCodexPath();
+  if (!codexPath) return null;
+  return summarizeCodexPluginList(runCapturedCommand(codexPath, ["plugin", "list"], 10000));
+}
+
+function installedPluginEntry(pluginList, id) {
+  const entry = pluginList?.relevantPlugins?.find((plugin) => plugin.id === id) || null;
+  return entry && entry.states.includes("installed") ? entry : null;
+}
+
+function lstatOrNull(filePath) {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function pluginVersionCacheDirs(pluginCacheRoot) {
+  if (!fs.existsSync(pluginCacheRoot)) return [];
+  return fs
+    .readdirSync(pluginCacheRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== "latest")
+    .map((entry) => path.join(pluginCacheRoot, entry.name))
+    .filter((candidate) => fs.existsSync(path.join(candidate, "scripts", "browser-client.mjs")))
+    .sort((a, b) =>
+      path.basename(a).localeCompare(path.basename(b), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      })
+    );
+}
+
+function selectPluginLatestTarget(versionDirs, entry) {
+  if (entry?.version) {
+    const exactVersion = versionDirs.find((dir) => path.basename(dir) === entry.version);
+    if (exactVersion) return exactVersion;
+  }
+  return versionDirs.at(-1) || null;
+}
+
+function ensurePluginLatestAlias(pluginCacheRoot, targetDir, args) {
+  const latestPath = path.join(pluginCacheRoot, "latest");
+  const targetName = path.basename(targetDir);
+  const latestStat = lstatOrNull(latestPath);
+
+  if (latestStat && latestStat.isDirectory() && !latestStat.isSymbolicLink()) {
+    return {
+      changed: false,
+      skipped: true,
+      message: `plugin latest alias exists as directory: ${latestPath}`,
+    };
+  }
+
+  if (latestStat && latestStat.isSymbolicLink()) {
+    const currentTarget = fs.readlinkSync(latestPath);
+    const currentResolved = path.resolve(pluginCacheRoot, currentTarget);
+    if (currentResolved === path.resolve(targetDir)) {
+      return {
+        changed: false,
+        skipped: false,
+        message: `plugin latest alias ok: ${latestPath} -> ${currentTarget}`,
+      };
+    }
+    if (args.dryRun) {
+      return {
+        changed: true,
+        skipped: false,
+        message: `replace plugin latest alias ${latestPath}: ${currentTarget} -> ${targetName}`,
+      };
+    }
+    fs.unlinkSync(latestPath);
+    fs.symlinkSync(targetName, latestPath, "dir");
+    return {
+      changed: true,
+      skipped: false,
+      message: `replaced plugin latest alias: ${latestPath} -> ${targetName}`,
+    };
+  }
+
+  if (latestStat) {
+    return {
+      changed: false,
+      skipped: true,
+      message: `plugin latest alias blocked by existing file: ${latestPath}`,
+    };
+  }
+
+  if (args.dryRun) {
+    return {
+      changed: true,
+      skipped: false,
+      message: `symlink ${latestPath} -> ${targetName}`,
+    };
+  }
+  fs.symlinkSync(targetName, latestPath, "dir");
+  return {
+    changed: true,
+    skipped: false,
+    message: `created plugin latest alias: ${latestPath} -> ${targetName}`,
+  };
+}
+
+function ensureInstalledPluginLatestAliases(args, pluginList = currentCodexPluginList()) {
+  const results = [];
+  for (const marketplace of ["openai-bundled", "openai-bundled-beta"]) {
+    for (const pluginName of ["chrome", "browser-use"]) {
+      const id = `${pluginName}@${marketplace}`;
+      const entry = installedPluginEntry(pluginList, id);
+      if (!entry) continue;
+
+      const pluginCacheRoot = path.join(args.codexHome, "plugins", "cache", marketplace, pluginName);
+      const versionDirs = pluginVersionCacheDirs(pluginCacheRoot);
+      const targetDir = selectPluginLatestTarget(versionDirs, entry);
+      if (!targetDir) continue;
+
+      const result = {
+        id,
+        path: path.join(pluginCacheRoot, "latest"),
+        target: targetDir,
+        ...ensurePluginLatestAlias(pluginCacheRoot, targetDir, args),
+      };
+      results.push(result);
+      logAction(args, result.message);
+    }
+  }
+  return results;
+}
+
 function upstreamCodexStatus(codexPath, paths) {
   const status = {
     available: Boolean(codexPath),
@@ -489,6 +716,39 @@ function upstreamCodexStatus(codexPath, paths) {
   status.mcpList = summarizeCodexMcpList(runCapturedCommand(codexPath, ["mcp", "list"], 10000), paths);
   status.pluginList = summarizeCodexPluginList(runCapturedCommand(codexPath, ["plugin", "list"], 10000));
   return status;
+}
+
+function parseSemver(version) {
+  const match = String(version || "").match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!match) return null;
+  return match.slice(1).map((part) => Number(part));
+}
+
+function compareSemver(a, b) {
+  const left = parseSemver(a);
+  const right = parseSemver(b);
+  if (!left || !right) return null;
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return 0;
+}
+
+function codexVersionFromCommand(codexPath) {
+  if (!codexPath) return null;
+  const result = runCapturedCommand(codexPath, ["--version"], 5000);
+  if (!result.ok) return null;
+  const match = String(result.stdout || "").match(/(\d+\.\d+\.\d+)/);
+  return match ? match[1] : null;
+}
+
+function recommendedToolSearchDeferFeatureEnabled(args) {
+  const codexVersion = codexVersionFromCommand(resolveCodexPath());
+  const comparison = compareSemver(codexVersion, TOOL_SEARCH_DIRECT_MCP_CODEX_MIN_VERSION);
+  if (comparison !== null && comparison >= 0) {
+    return false;
+  }
+  return true;
 }
 
 function resolveCodexPath() {
@@ -699,6 +959,7 @@ function patchBrowserClient(text) {
   output = patchBrowserClientExtensionVisibleScreenshots(output);
   output = patchBrowserClientPreferExtensionVisibleScreenshots(output);
   output = patchBrowserClientExtensionNavigateResult(output);
+  output = patchBrowserClientClipboardCurrentDocument(output);
   output = patchBrowserClientInputPasteFallback(output);
   return output;
 }
@@ -814,6 +1075,8 @@ const BROWSER_CLIENT_PREFER_EXTENSION_VISIBLE_SCREENSHOT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-prefer-extension-visible-screenshots";
 const BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-extension-navigate-result";
+const BROWSER_CLIENT_CLIPBOARD_CURRENT_DOCUMENT_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: browser-client-clipboard-current-document";
 const BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-input-paste-fallback";
 const NODE_REPL_CHROMIUM_AUTOSTART_MARKER =
@@ -911,6 +1174,19 @@ function patchBrowserClientExtensionNavigateResult(text) {
   );
 
   return `/* ${BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER} */\n${output}`;
+}
+
+function patchBrowserClientClipboardCurrentDocument(text) {
+  if (text.includes(BROWSER_CLIENT_CLIPBOARD_CURRENT_DOCUMENT_PATCH_MARKER)) return text;
+
+  const output = replaceRequired(
+    text,
+    'async function GN(t,e){HN(t);let r=_p.get(t);r==null&&(r=new Map,_p.set(t,r));let n=r.get(e);n==null&&(n=(async()=>{let o=$N(),i;try{i=(await t.cdp.call(e,"Page.addScriptToEvaluateOnNewDocument",{runImmediately:!0,source:o})).identifier;let a=await t.cdp.call(e,"Runtime.evaluate",{expression:o,returnByValue:!0}),u=Bw(a,"Browser Use virtual clipboard install failed");if(u!=null)throw new Error(`Browser Use virtual clipboard install failed: ${u}`);return i==null?{}:{identifier:i}}catch(s){throw i!=null&&await t.cdp.call(e,"Page.removeScriptToEvaluateOnNewDocument",{identifier:i}).catch(()=>{}),s}})().catch(o=>{throw r.delete(e),o}),r.set(e,n)),await n}',
+    'async function GN(t,e,s=!1){HN(t);let r=_p.get(t);r==null&&(r=new Map,_p.set(t,r));let n=r.get(e);n==null&&(n=(async()=>{let o=$N(),i;try{i=(await t.cdp.call(e,"Page.addScriptToEvaluateOnNewDocument",{runImmediately:!0,source:o})).identifier;let a=await t.cdp.call(e,"Runtime.evaluate",{expression:o,returnByValue:!0}),u=Bw(a,"Browser Use virtual clipboard install failed");if(u!=null)throw new Error(`Browser Use virtual clipboard install failed: ${u}`);return i==null?{}:{identifier:i}}catch(s){throw i!=null&&await t.cdp.call(e,"Page.removeScriptToEvaluateOnNewDocument",{identifier:i}).catch(()=>{}),s}})().catch(o=>{throw r.delete(e),o}),r.set(e,n)),await n;let o=null;try{let i=await t.cdp.call(e,"Runtime.evaluate",{expression:`(${Ow.toString()})()`,returnByValue:!0});o=Bw(i,"Browser Use virtual clipboard current document check failed")}catch(i){o=i?.message??String(i)}if(o==null)return;if(s)throw new Error(`Browser Use virtual clipboard install is not active in current document: ${o}`);r.delete(e);let i=await n.catch(()=>{});i?.identifier!=null&&await t.cdp.call(e,"Page.removeScriptToEvaluateOnNewDocument",{identifier:i.identifier}).catch(()=>{});return await GN(t,e,!0)}',
+    "Browser client clipboard current-document reinstall"
+  );
+
+  return `/* ${BROWSER_CLIENT_CLIPBOARD_CURRENT_DOCUMENT_PATCH_MARKER} */\n${output}`;
 }
 
 function patchBrowserClientInputPasteFallback(text) {
@@ -1265,6 +1541,12 @@ const CHROME_SKILL_TIMEOUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-timeout-recovery";
 const CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-command-scoping";
+const TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: tab-info-handle-guidance";
+const SUPPORTED_EXTRACTION_GUIDANCE =
+  "does not expose `evaluate`, `page.evaluate`, or `locator(...).evaluateAll()`";
+const TAB_INFO_HANDLE_GUIDANCE =
+  "`browser.tabs.list()` and `browser.user.openTabs()` return info objects, not controllable `Tab` handles. Do not call `goto()`, `url()`, `title()`, `playwright`, `cua`, `close()`, or other tab methods on those objects. For a current session tab, pick the `TabInfo`, then run `const tab = await browser.tabs.get(info.id)` and use that returned `Tab`. For a user browser tab from `openTabs()`, pass the returned object to `const tab = await browser.user.claimTab(info)` and use the claimed `Tab`.";
 
 function patchBrowserSkill(text) {
   text = text.replace(
@@ -1289,7 +1571,10 @@ function patchBrowserSkill(text) {
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
     text.includes("browser_cleanup") &&
-    text.includes("Do not run a lightweight tab check after a timeout/reset")
+    text.includes("Do not run a lightweight tab check after a timeout/reset") &&
+    text.includes(SUPPORTED_EXTRACTION_GUIDANCE) &&
+    text.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
+    text.includes(TAB_INFO_HANDLE_GUIDANCE)
   ) {
     return text;
   }
@@ -1362,11 +1647,15 @@ For Browser plugin tasks, the Linux compatibility MCP server may appear as \`bro
 
 Before ending a Browser task, call \`browser_cleanup\` from the same MCP server when it is visible. It runs the current session's tab finalizer with an empty keep list, equivalent to \`await browser.tabs.finalize({ keep: [] })\`, and avoids leaving Chromium full of task tabs. If \`browser_cleanup\` is not visible, run that finalizer in a final single-purpose \`js\` call.
 
+<!-- ${TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER} -->
+
+${TAB_INFO_HANDLE_GUIDANCE}
+
 Screenshots and \`domSnapshot()\` are supported Browser capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
 
-Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, a targeted locator/evaluate check is usually cheaper than \`tab.playwright.domSnapshot()\`, but the full snapshot remains valid when it is the right evidence.
+Keep each browser bridge call short and single-purpose on Linux Chromium. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, prefer supported locator reads such as a narrowly scoped \`locator(...).count()\`, \`locator(...).allTextContents({ timeoutMs })\`, \`locator(...).getAttribute(...)\`, \`locator(...).textContent()\`, or \`locator(...).innerText()\`. The \`tab.playwright\` object in this runtime ${SUPPORTED_EXTRACTION_GUIDANCE}, so do not use those APIs.
 
-For page extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
+For page extraction, return compact data from supported locator methods, and keep broad text reads scoped to an exact container you already identified. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind. If you need structured multi-field extraction that would normally require page-side JavaScript, use \`domSnapshot()\` and parse the relevant lines or change strategy instead of inventing unsupported evaluate APIs.
 
 If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, the Linux runtime may have reset the JS context and removed old \`browser\` and \`tab\` bindings. Run \`js_reset\`, re-bootstrap the Browser runtime, create a new \`globalThis.tab\`, navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
@@ -1453,7 +1742,10 @@ function patchChromeSkill(text) {
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
     text.includes("browser_cleanup") &&
-    text.includes("Do not run a lightweight tab check after a timeout/reset")
+    text.includes("Do not run a lightweight tab check after a timeout/reset") &&
+    text.includes(SUPPORTED_EXTRACTION_GUIDANCE) &&
+    text.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
+    text.includes(TAB_INFO_HANDLE_GUIDANCE)
   ) {
     return text;
   }
@@ -1496,6 +1788,10 @@ Do not use \`browser_node_repl\` for Chrome plugin tasks. \`browser_node_repl\` 
 
 Before ending a Chrome task, call \`browser_cleanup\` from \`node_repl\` when it is visible. It runs the current session's tab finalizer with an empty keep list, equivalent to \`await browser.tabs.finalize({ keep: [] })\`, and avoids leaving Chromium full of task tabs. If \`browser_cleanup\` is not visible, run that finalizer in a final single-purpose \`js\` call.
 
+<!-- ${TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER} -->
+
+${TAB_INFO_HANDLE_GUIDANCE}
+
 ## Screenshot Output Compatibility
 
 <!-- ${SCREENSHOT_OUTPUT_PATCH_MARKER} -->
@@ -1520,9 +1816,9 @@ nodeRepl.write(\`Markdown image: ![Google screenshot](\${imagePath})\\n\`);
 
 Screenshots and \`domSnapshot()\` are supported Chrome capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
 
-Keep each Chromium bridge call short and single-purpose. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, a targeted locator/evaluate check is usually cheaper than \`tab.playwright.domSnapshot()\`, but the full snapshot remains valid when it is the right evidence.
+Keep each Chromium bridge call short and single-purpose. Do not combine click, fill, keyboard input, or navigation with \`domSnapshot()\`, screenshot capture, dev logs, or extraction loops in the same \`js\` call. Run one interaction, then verify in a fresh follow-up call. For data extraction that does not need the full tree, prefer supported locator reads such as a narrowly scoped \`locator(...).count()\`, \`locator(...).allTextContents({ timeoutMs })\`, \`locator(...).getAttribute(...)\`, \`locator(...).textContent()\`, or \`locator(...).innerText()\`. The \`tab.playwright\` object in this runtime ${SUPPORTED_EXTRACTION_GUIDANCE}, so do not use those APIs.
 
-For extraction, return compact data with one page-side expression such as \`locator(...).evaluateAll(...)\` or \`page.evaluate(...)\`. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind.
+For extraction, return compact data from supported locator methods, and keep broad text reads scoped to an exact container you already identified. Avoid \`locator(...).all()\` followed by many awaited per-element calls inside one bridge call; if one element query hangs, the whole MCP call times out and can leave stale browser commands behind. If you need structured multi-field extraction that would normally require page-side JavaScript, use \`domSnapshot()\` and parse the relevant lines or change strategy instead of inventing unsupported evaluate APIs.
 
 If a call fails with \`native pipe is closed\`, \`Detached while handling command\`, or \`Timed out after ... waiting for CDP command\`, the Linux runtime may have reset the JS context and removed old \`browser\` and \`tab\` bindings. Run \`js_reset\`, re-bootstrap the Chrome runtime, create a new \`globalThis.tab\`, navigate to the target URL again, then continue with single-purpose calls. Do not reuse old \`browser\` or \`tab\` objects, and do not recover by finding an existing tab with the same URL after that error.
 
@@ -1681,7 +1977,9 @@ function commitPluginPatchPlans(plans, args) {
 }
 
 function patchPlugins(args) {
-  return commitPluginPatchPlans(planPluginPatches(args), args);
+  const plans = commitPluginPatchPlans(planPluginPatches(args), args);
+  ensureInstalledPluginLatestAliases(args);
+  return plans;
 }
 
 function sudoExec(argsList) {
@@ -1749,7 +2047,7 @@ function installDesktopShims(args, paths) {
 }
 
 function windowsNodeReplCommands(args) {
-  const commands = [...args.windowsNodeReplPaths];
+  const commands = [...args.windowsNodeReplPaths, ...detectWindowsOpenAICodexBinNodeReplPaths(args)];
   for (const username of args.windowsUsernames) {
     for (const appDir of WINDOWS_DESKTOP_APP_DIRS) {
       for (const replName of WINDOWS_NODE_REPL_NAMES) {
@@ -1759,6 +2057,28 @@ function windowsNodeReplCommands(args) {
     }
   }
   return uniqueStrings(commands);
+}
+
+function detectWindowsOpenAICodexBinNodeReplPaths(args) {
+  const sqlite = commandPath("sqlite3");
+  if (!sqlite) return [];
+  const logsDb = path.join(args.codexHome, "logs_2.sqlite");
+  if (!fs.existsSync(logsDb)) return [];
+  const query = [
+    "select feedback_log_body from logs",
+    "where feedback_log_body like '%AppData%Local%OpenAI%Codex%bin%node_repl%'",
+    "order by id desc limit 250;",
+  ].join(" ");
+  const result = childProcess.spawnSync(sqlite, ["-batch", "-noheader", logsDb, query], {
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) return [];
+  return uniqueStrings(
+    [...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE)].map((match) =>
+      match[0].replace(/\\+/g, "\\")
+    )
+  );
 }
 
 function userPathShimDirs() {
@@ -1808,13 +2128,14 @@ function existingPath(filePath) {
 function writeCodexFeatureConfig(args) {
   const configPath = path.join(args.codexHome, "config.toml");
   const existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
-  const updated = ensureTomlFeatureFlag(existing, TOOL_SEARCH_DEFER_FEATURE, true);
+  const enabled = recommendedToolSearchDeferFeatureEnabled(args);
+  const updated = ensureTomlFeatureFlag(existing, TOOL_SEARCH_DEFER_FEATURE, enabled);
   if (updated === existing) {
-    logAction(args, `config.toml ${TOOL_SEARCH_DEFER_FEATURE} already enabled`);
+    logAction(args, `config.toml ${TOOL_SEARCH_DEFER_FEATURE} already ${enabled ? "enabled" : "disabled"}`);
     return false;
   }
   if (args.dryRun) {
-    logAction(args, `enable ${TOOL_SEARCH_DEFER_FEATURE} in ${configPath}`);
+    logAction(args, `${enabled ? "enable" : "disable"} ${TOOL_SEARCH_DEFER_FEATURE} in ${configPath}`);
     return true;
   }
   mkdirp(path.dirname(configPath), args);
@@ -1944,6 +2265,7 @@ function install(args) {
   installRuntime(args);
   installNativeHostManifests(args, paths);
   commitPluginPatchPlans(pluginPatchPlans, args);
+  ensureInstalledPluginLatestAliases(args);
   if (args.patchChromiumExtension) commitChromiumExtensionPatch(chromiumExtensionPatchPlan, args);
   if (!args.skipFeatureConfig) writeCodexFeatureConfig(args);
   if (args.writeCodexConfig) writeCodexConfig(args, paths);
@@ -2025,6 +2347,9 @@ function patchStatusForRoot(root, paths) {
     browserClientExtensionNavigateResult:
       browserClient.includes(BROWSER_CLIENT_EXTENSION_NAVIGATE_RESULT_PATCH_MARKER) &&
       browserClient.includes("codexLinuxNavigationResultMatches"),
+    browserClientClipboardCurrentDocument:
+      browserClient.includes(BROWSER_CLIENT_CLIPBOARD_CURRENT_DOCUMENT_PATCH_MARKER) &&
+      browserClient.includes("virtual clipboard current document check"),
     browserClientInputPasteFallback:
       browserClient.includes(BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER) &&
       browserClient.includes('["text","search","url","tel","password"]'),
@@ -2044,6 +2369,10 @@ function patchStatusForRoot(root, paths) {
       browserSkillMentionsBrowserNodeRepl: browserSkill.includes(BROWSER_SKILL_NODE_REPL_PATCH_MARKER),
       browserSkillTimeoutRecovery: browserSkill.includes(BROWSER_SKILL_TIMEOUT_PATCH_MARKER),
       browserSkillCommandScoping: browserSkill.includes(BROWSER_SKILL_COMMAND_SCOPING_PATCH_MARKER),
+      browserSkillSupportedExtractionGuidance: browserSkill.includes(SUPPORTED_EXTRACTION_GUIDANCE),
+      browserSkillTabInfoHandleGuidance:
+        browserSkill.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
+        browserSkill.includes(TAB_INFO_HANDLE_GUIDANCE),
       browserSkillChromiumAutostart:
         browserSkill.includes(BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER) &&
         browserSkill.includes("ensureChromiumExtensionReady"),
@@ -2086,6 +2415,10 @@ function patchStatusForRoot(root, paths) {
       chromeSkill.includes("final answer must include the Markdown image link"),
     chromeSkillTimeoutRecovery: chromeSkill.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER),
     chromeSkillCommandScoping: chromeSkill.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER),
+    chromeSkillSupportedExtractionGuidance: chromeSkill.includes(SUPPORTED_EXTRACTION_GUIDANCE),
+    chromeSkillTabInfoHandleGuidance:
+      chromeSkill.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
+      chromeSkill.includes(TAB_INFO_HANDLE_GUIDANCE),
   };
 }
 
@@ -2174,6 +2507,7 @@ function doctor(args) {
   const paths = runtimePaths(args);
   const pluginRoots = detectPluginRoots(args);
   const codexPath = resolveCodexPath();
+  const upstreamCodex = upstreamCodexStatus(codexPath, paths);
   const configPath = path.join(args.codexHome, "config.toml");
   const configText = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
   const nodeReplConfig = findTomlTable(configText, "mcp_servers.node_repl");
@@ -2190,13 +2524,16 @@ function doctor(args) {
       googleChrome: commandPath("google-chrome"),
       codex: codexPath,
     },
-    upstreamCodex: upstreamCodexStatus(codexPath, paths),
+    upstreamCodex,
     codexHome: args.codexHome,
     installRoot: args.installRoot,
     browserConfigRoot: args.browserConfigRoot,
     codexConfig: {
       path: configPath,
-      toolSearchAlwaysDeferMcpTools: codexFeatureFlagStatus(configText, TOOL_SEARCH_DEFER_FEATURE),
+      toolSearchAlwaysDeferMcpTools: {
+        ...codexFeatureFlagStatus(configText, TOOL_SEARCH_DEFER_FEATURE),
+        recommendedEnabled: recommendedToolSearchDeferFeatureEnabled(args),
+      },
       nodeReplMcp: nodeReplConfigBlockStatus(nodeReplConfig?.block || "", paths),
     },
     runtime: {
@@ -2220,7 +2557,13 @@ function doctor(args) {
       path: shim.path,
       exists: fs.existsSync(shim.path),
     })),
-    pluginRoots: pluginRoots.map((root) => patchStatusForRoot(root, paths)),
+    pluginRoots: pluginRoots.map((root) => {
+      const status = patchStatusForRoot(root, paths);
+      return {
+        ...status,
+        installInfo: pluginInstallInfoForRoot(root, status.kind, upstreamCodex.pluginList),
+      };
+    }),
   };
 
   if (args.json) {
@@ -2260,10 +2603,17 @@ function doctor(args) {
   }
   console.log(`install root: ${report.installRoot}`);
   console.log(`browser config root: ${report.browserConfigRoot}`);
+  const toolSearchFeature = report.codexConfig.toolSearchAlwaysDeferMcpTools;
+  const toolSearchFeatureOk =
+    toolSearchFeature.exists
+      ? toolSearchFeature.enabled === toolSearchFeature.recommendedEnabled
+      : toolSearchFeature.recommendedEnabled === false;
   console.log(
     `config ${TOOL_SEARCH_DEFER_FEATURE}: ${
-      report.codexConfig.toolSearchAlwaysDeferMcpTools.enabled ? "ok" : "missing/disabled"
-    } ${report.codexConfig.path}`
+      toolSearchFeatureOk ? "ok" : "mismatch"
+    } value=${toolSearchFeature.exists ? String(toolSearchFeature.enabled) : "unset"} recommended=${String(
+      toolSearchFeature.recommendedEnabled
+    )} ${report.codexConfig.path}`
   );
   console.log(
     `config node_repl: ${
@@ -2324,13 +2674,17 @@ function doctor(args) {
   }
   for (const root of report.pluginRoots) {
     const ok = Object.entries(root)
-      .filter(([key]) => !["root", "kind"].includes(key))
+      .filter(([key]) => !["root", "kind", "installInfo"].includes(key))
       .every(([key, value]) => {
         if (typeof value === "boolean") return value === true;
         if (key === "pluginMcpNodeRepl") return value.pathMatches === true;
         return true;
       });
-    console.log(`plugin: ${ok ? "ok" : "needs patch"} ${root.kind} ${root.root}`);
+    console.log(
+      `plugin: ${ok ? "ok" : "needs patch"} ${root.kind} (${formatPluginInstallInfo(
+        root.installInfo
+      )}) ${root.root}`
+    );
     if (root.pluginMcpNodeRepl.exists && root.pluginMcpNodeRepl.nodeReplExists) {
       console.log(
         `  plugin mcp ${root.pluginMcpNodeRepl.serverName}: ${

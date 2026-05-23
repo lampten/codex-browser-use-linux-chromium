@@ -33,6 +33,9 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   screenshot capture and DOM snapshots, so Chromium-side hangs return a
   recoverable error instead of stalling the MCP call until the outer tool
   transport closes.
+- Revalidates Browser Use's virtual clipboard in the current document before
+  paste-backed text input, so repeated navigation in the same tab does not
+  leave `locator.type()` / paste-style input with a stale clipboard install.
 - On Linux Chromium, can patch the official extension with a non-CDP
   `chrome.tabs.captureVisibleTab` endpoint. Normal visible-viewport screenshots
   use that endpoint first, bypassing the `Page.captureScreenshot` debugger path
@@ -81,9 +84,10 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   connects to the Linux host and sends its own `node_repl` path through
   `RefreshMcpServers`.
 - Optionally installs Windows Desktop remote path shims for common Codex and
-  Codex Beta install paths under `AppData\\Local\\Programs`. This is needed
-  when Codex Desktop on Windows sends a Windows-local `node_repl.exe` command
-  to the Linux app-server.
+  Codex Beta install paths under `AppData\\Local\\Programs`, plus hashed
+  `AppData\\Local\\OpenAI\\Codex\\bin\\...` paths discovered in app-server
+  logs. This is needed when Codex Desktop on Windows sends a Windows-local
+  `node_repl.exe` command to the Linux app-server.
 
 ## Security and Approval Model
 
@@ -151,6 +155,10 @@ node bin/codex-browser-use-linux-chromium.js doctor
   runtime. Chrome plugin roots use `node_repl`; Browser Use plugin roots use
   `browser_node_repl`. The installer also adds `mcpServers` metadata to Chrome
   and Browser Use plugin manifests when the official cache does not ship it.
+- Ensures installed bundled plugin caches keep a `latest` alias pointing at the
+  installed version directory, so Codex can still discover plugin skills such as
+  `@chrome` after `codex plugin add` or update operations materialize only a
+  versioned cache path.
 - With `--patch-chromium-extension`, patches the system Chromium Codex extension
   background script under `/usr/share/chromium/extensions/codex` so viewport
   screenshots can use `chrome.tabs.captureVisibleTab` instead of the debugger
@@ -160,10 +168,12 @@ node bin/codex-browser-use-linux-chromium.js doctor
   unpatched sockets are still present. The installer also bumps the unpacked
   extension version, for example from `1.1.4` to `1.1.4.1`, to force Chromium to
   refresh the extension service worker.
-- Enables `features.tool_search_always_defer_mcp_tools = true` in
-  `~/.codex/config.toml` so Codex 0.130+ exposes plugin MCP tools such as
-  `node_repl/js` through `tool_search`. Pass `--skip-feature-config` only if
-  you want to manage that feature flag yourself.
+- Sets `features.tool_search_always_defer_mcp_tools` in `~/.codex/config.toml`
+  for the detected Codex CLI version. Codex 0.130-0.132 need `true` so
+  `node_repl/js` is discoverable through `tool_search`; Codex 0.133+ works
+  better with `false` on Desktop remote sessions so small MCP tool sets such as
+  `node_repl/js` are exposed directly. Pass `--skip-feature-config` only if you
+  want to manage that feature flag yourself.
 - With `--desktop-shims`, creates Linux shims for macOS Codex Desktop remote
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`
@@ -173,6 +183,10 @@ node bin/codex-browser-use-linux-chromium.js doctor
   `C:\\Users\\<name>\\AppData\\Local\\Programs\\...\\resources\\node_repl.exe`.
   The installer generates both the local Linux username and a capitalized
   variant; pass `--windows-username NAME` when the Windows account name differs.
+  It also scans `~/.codex/logs_2.sqlite` for recent Codex 0.133-style hashed
+  paths such as
+  `C:\\Users\\<name>\\AppData\\Local\\OpenAI\\Codex\\bin\\<hash>\\node_repl.exe`
+  and creates shims for the exact commands it finds.
   Backslash-form Windows commands are installed into both `~/.local/bin` and
   `~/.npm-global/bin`, so the app-server can find them through PATH.
 - With `--system-native-host`, writes system native host manifests:
@@ -195,17 +209,19 @@ directories.
 
 ## Optional Codex CLI Config
 
-The installer always enables this Codex 0.130+ compatibility flag unless
-`--skip-feature-config` is passed:
+The installer manages this compatibility flag unless `--skip-feature-config` is
+passed:
 
 ```toml
 [features]
-tool_search_always_defer_mcp_tools = true
+tool_search_always_defer_mcp_tools = false
 ```
 
-Without it, `node_repl` can be registered as a direct MCP tool but absent from
-`tool_search`, which makes Chrome/Browser skills report that no JS tool is
-available even though `codex mcp list` shows the server.
+For Codex 0.133+, `false` keeps small MCP tool sets directly callable. This
+avoids Desktop remote sessions that can start `node_repl` but fail to include it
+in the remote `tool_search` index. For Codex 0.130-0.132, the installer keeps
+the older `true` behavior because those versions relied on `tool_search` for
+Chrome/Browser skill discovery.
 
 Codex 0.130 also de-duplicates plugin MCP servers by name. If both the Chrome
 and Browser Use plugin caches declare `node_repl`, the first loaded plugin can
@@ -227,6 +243,15 @@ evidence. A failing upstream terminal check such as `TERM=dumb` does not by
 itself mean the Chromium bridge is broken; use this project's native-host,
 extension, socket, and plugin-cache checks for the browser-specific path.
 
+Codex 0.133 keeps those bridge requirements in place. Its `codex plugin list`
+output is marketplace-grouped table output with installed version and plugin
+path columns; this project's `doctor` accepts both the older 0.131/0.132 list
+format and the 0.133 table format when reporting Browser Use / Chrome plugin
+state. `install` and `patch-plugin` also recreate the installed bundled plugin
+`latest` cache alias when Codex has only left a versioned directory such as
+`chrome/0.1.7`; without that alias, `@chrome` may disappear from skill
+discovery even though the Chrome plugin is still installed and enabled.
+
 For direct Codex CLI usage, also add:
 
 ```bash
@@ -245,9 +270,11 @@ Codex Desktop remote sessions may still override MCP config via
 ## Windows Desktop Clients
 
 Windows Codex Desktop may send a Windows-local `node_repl` command path through
-`RefreshMcpServers`, for example a path under `AppData\\Local\\Programs`.
-That path varies by Windows username and install channel. Install the common
-Windows stable/Beta shims with:
+`RefreshMcpServers`, for example a path under `AppData\\Local\\Programs` or a
+hashed app binary path under `AppData\\Local\\OpenAI\\Codex\\bin`. That path
+varies by Windows username, install channel, and app update. Install the common
+Windows stable/Beta shims and any hashed paths already seen in app-server logs
+with:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js install --windows-shims --windows-username YOUR_WINDOWS_USER
@@ -261,8 +288,12 @@ C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe
 ```
 
 and forward-slash variants like `C:/Users/Josh/.../node_repl.exe`. If Codex
-Desktop uses a custom install path, inspect the Linux host app-server log for
-the exact `RefreshMcpServers` `node_repl.command` value and pass it explicitly:
+Desktop has already sent a hashed command like
+`C:\\Users\\Josh\\AppData\\Local\\OpenAI\\Codex\\bin\\3c238e29bbc930ff\\node_repl.exe`,
+the installer discovers it from `~/.codex/logs_2.sqlite` automatically. If
+Codex Desktop uses a custom install path that is not in the logs, inspect the
+Linux host app-server log for the exact `RefreshMcpServers` `node_repl.command`
+value and pass it explicitly:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js install --windows-shims \
@@ -304,7 +335,10 @@ includes the upstream Codex version, official `codex mcp list` entries for
 `node_repl` and `browser_node_repl`, and the Browser/Chrome plugin install
 state. If those look correct, search
 `logs_2.sqlite` for `RefreshMcpServers` and verify the exact `node_repl.command`
-exists on the Linux host. Also search the logs for `skipping duplicate plugin
+exists on the Linux host; on Windows Desktop 0.133+ this may be a hashed
+`AppData\\Local\\OpenAI\\Codex\\bin\\...\\node_repl.exe` command, so rerun
+`install --windows-shims` after the failed attempt to let the installer create
+that exact shim. Also search the logs for `skipping duplicate plugin
 MCP server name`: if Chrome and Browser Use both declare `node_repl`, reinstall
 this compatibility layer so Browser Use is moved to `browser_node_repl`, then
 restart `codex app-server`. On Codex 0.130+ remote hosts, verify both
@@ -347,9 +381,19 @@ On Linux Chromium, keep browser bridge calls short and single-purpose. Do not
 combine click/fill/keyboard/navigation with `domSnapshot()`, screenshots, dev
 logs, or per-element extraction loops in one `js` call. Run the interaction,
 then verify in a fresh follow-up call. Use screenshots for visual evidence and
-`domSnapshot()` when a full accessibility snapshot is the right evidence; use a
-compact targeted `evaluate` only when the task does not need the full tree. If a
-call fails with `native pipe is closed`, `Detached while handling command`, or
+`domSnapshot()` when a full accessibility snapshot is the right evidence; use
+supported locator reads such as scoped `count()`, `allTextContents()`,
+`getAttribute()`, `textContent()`, or `innerText()` only when the task does not
+need the full tree. This runtime does not expose `evaluate`, `page.evaluate`, or
+`locator(...).evaluateAll()`.
+
+`browser.tabs.list()` and `browser.user.openTabs()` return info objects, not
+controllable `Tab` handles. Do not call `tab.goto()` or Playwright/CUA methods
+on those list results. Reacquire a current-session tab with
+`await browser.tabs.get(info.id)`, or claim a user tab with
+`await browser.user.claimTab(info)`, then call `goto()` on the returned `Tab`.
+
+If a call fails with `native pipe is closed`, `Detached while handling command`, or
 `Timed out after ... waiting for CDP command`, the REPL resets its stale browser
 context by default; run `js_reset`, re-bootstrap, create a new tab, and navigate
 to the target URL again before retrying. A follow-up `tab is not defined` error
