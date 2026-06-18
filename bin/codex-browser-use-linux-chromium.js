@@ -2289,8 +2289,11 @@ function installDesktopShims(args, paths) {
   const nodePath = commandPath("node") || process.execPath;
   const codexPath = resolveCodexPath() || "";
   const shim = nodeReplShimContents(args, paths);
+  for (const shimPath of desktopNodeReplShimPaths()) {
+    writePrivilegedShim(shimPath, shim, args);
+    ensurePrivilegedDesktopShimDirectoryModes(shimPath, args);
+  }
   for (const dir of DESKTOP_SHIM_DIRS) {
-    writePrivilegedShim(path.join(dir, "node_repl"), shim, args);
     if (!args.dryRun) {
       sudoExec(["ln", "-sfn", nodePath, path.join(dir, "node")]);
       if (codexPath) sudoExec(["ln", "-sfn", codexPath, path.join(dir, "codex")]);
@@ -2299,6 +2302,26 @@ function installDesktopShims(args, paths) {
       if (codexPath) logAction(args, `sudo ln -sfn ${codexPath} ${path.join(dir, "codex")}`);
     }
   }
+}
+
+function ensurePrivilegedDesktopShimDirectoryModes(shimPath, args) {
+  const binDir = path.dirname(shimPath);
+  if (!binDir.endsWith(path.join("cua_node", "bin"))) return;
+  const cuaNodeDir = path.dirname(binDir);
+  if (args.dryRun) {
+    logAction(args, `sudo chmod 755 ${cuaNodeDir}`);
+    logAction(args, `sudo chmod 755 ${binDir}`);
+    return;
+  }
+  sudoExec(["chmod", "755", cuaNodeDir]);
+  sudoExec(["chmod", "755", binDir]);
+}
+
+function desktopNodeReplShimPaths() {
+  return DESKTOP_SHIM_DIRS.flatMap((dir) => [
+    path.join(dir, "node_repl"),
+    path.join(dir, "cua_node", "bin", "node_repl"),
+  ]);
 }
 
 function windowsNodeReplCommands(args) {
@@ -2833,10 +2856,10 @@ function doctor(args) {
       nativeManifestStatus(manifestPath, paths.nativeHostBridge)
     ),
     browserUseSockets: browserUseSocketStatus(),
-    desktopShims: [
-      path.join(DESKTOP_SHIM_DIRS[0], "node_repl"),
-      path.join(DESKTOP_SHIM_DIRS[1], "node_repl"),
-    ].map((shimPath) => ({ path: shimPath, exists: fs.existsSync(shimPath) })),
+    desktopShims: desktopNodeReplShimPaths().map((shimPath) => ({
+      path: shimPath,
+      exists: fs.existsSync(shimPath),
+    })),
     windowsDesktopShims: windowsDesktopShimTargets(args).map((shim) => ({
       command: shim.command,
       path: shim.path,

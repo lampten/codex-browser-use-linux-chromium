@@ -184,7 +184,9 @@ node bin/codex-browser-use-linux-chromium.js doctor
 - With `--desktop-shims`, creates Linux shims for macOS Codex Desktop remote
   paths:
   - `/Applications/Codex.app/Contents/Resources/node_repl`
+  - `/Applications/Codex.app/Contents/Resources/cua_node/bin/node_repl`
   - `/Applications/Codex (Beta).app/Contents/Resources/node_repl`
+  - `/Applications/Codex (Beta).app/Contents/Resources/cua_node/bin/node_repl`
 - With `--windows-shims`, creates Linux shims for common Windows Codex Desktop
   remote paths, including stable and Beta paths under
   `C:\\Users\\<name>\\AppData\\Local\\Programs\\...\\resources\\node_repl.exe`.
