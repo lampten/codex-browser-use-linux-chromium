@@ -1225,23 +1225,34 @@ const tools = [
   },
 ];
 
-function writeMessage(message) {
-  ORIGINAL_STDOUT_WRITE(`${JSON.stringify(message)}\n`);
+function writeMessage(message, framing = "newline") {
+  const body = JSON.stringify(message);
+  if (message?.id !== undefined && (message.result?.tools || message.result?.serverInfo)) {
+    log("mcp response", `id=${message.id} framing=${framing} bytes=${Buffer.byteLength(body, "utf8")}`);
+  }
+  if (framing === "content-length") {
+    ORIGINAL_STDOUT_WRITE(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
+    return;
+  }
+  ORIGINAL_STDOUT_WRITE(`${body}\n`);
 }
 
-function sendResult(id, result) {
-  writeMessage({ jsonrpc: "2.0", id, result });
+function sendResult(id, result, framing) {
+  writeMessage({ jsonrpc: "2.0", id, result }, framing);
 }
 
-function sendError(id, error) {
-  writeMessage({
-    jsonrpc: "2.0",
-    id,
-    error: {
-      code: -32000,
-      message: errorMessage(error),
+function sendError(id, error, framing) {
+  writeMessage(
+    {
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32000,
+        message: errorMessage(error),
+      },
     },
-  });
+    framing
+  );
 }
 
 function toolErrorResult(error) {
@@ -1359,36 +1370,44 @@ async function callTool(name, args = {}) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
-async function handleMessage(message) {
+async function handleMessage(message, framing = "newline") {
   if (!message || typeof message !== "object") return;
   if (!Object.prototype.hasOwnProperty.call(message, "id")) return;
+  if (message.method === "initialize" || message.method === "tools/list") {
+    log("mcp request", `method=${message.method} id=${message.id} framing=${framing}`);
+  }
 
   try {
     switch (message.method) {
       case "initialize":
-        sendResult(message.id, {
-          protocolVersion: message.params?.protocolVersion || "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "node_repl", version: "0.1.0" },
-        });
+        sendResult(
+          message.id,
+          {
+            protocolVersion: message.params?.protocolVersion || "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "node_repl", version: "0.1.0" },
+          },
+          framing
+        );
         break;
       case "tools/list":
-        sendResult(message.id, { tools });
+        sendResult(message.id, { tools }, framing);
         break;
       case "tools/call":
         sendResult(
           message.id,
-          await callTool(message.params?.name, message.params?.arguments || {})
+          await callTool(message.params?.name, message.params?.arguments || {}),
+          framing
         );
         break;
       default:
-        sendError(message.id, new Error(`Unsupported MCP method: ${message.method}`));
+        sendError(message.id, new Error(`Unsupported MCP method: ${message.method}`), framing);
     }
   } catch (error) {
     log("request failed", `${message.method || "unknown"} ${error.stack || error.message}`);
     if (error?.name === "JsTimeoutError" && EXIT_ON_TIMEOUT) scheduleTimeoutExit();
     try {
-      sendError(message.id, error);
+      sendError(message.id, error, framing);
     } catch (writeError) {
       log("failed to send error", writeError.stack || writeError.message);
     }
@@ -1396,11 +1415,10 @@ async function handleMessage(message) {
 }
 
 let input = Buffer.alloc(0);
-const CONTENT_LENGTH_HEADER = Buffer.from("content-length:", "ascii");
 
-function enqueueMessage(message) {
+function enqueueMessage(message, framing) {
   queue = queue
-    .then(() => handleMessage(message))
+    .then(() => handleMessage(message, framing))
     .catch((error) => log("queued request failed", error.stack || error.message))
     .finally(() => {
       if (endRequested) queueMicrotask(() => shutdown());
@@ -1418,14 +1436,8 @@ function trimLeadingTransportWhitespace(buffer) {
   return offset === 0 ? buffer : buffer.slice(offset);
 }
 
-function startsWithContentLength(buffer) {
-  if (buffer.length < CONTENT_LENGTH_HEADER.length) return false;
-  return (
-    buffer
-      .slice(0, CONTENT_LENGTH_HEADER.length)
-      .toString("ascii")
-      .toLowerCase() === CONTENT_LENGTH_HEADER.toString("ascii")
-  );
+function startsWithJsonMessage(buffer) {
+  return buffer[0] === 0x7b || buffer[0] === 0x5b;
 }
 
 function headerEnd(buffer) {
@@ -1455,6 +1467,7 @@ function parseContentLengthMessage(buffer) {
 
   return {
     message: JSON.parse(buffer.slice(bodyStart, bodyEnd).toString("utf8")),
+    framing: "content-length",
     rest: buffer.slice(bodyEnd),
   };
 }
@@ -1466,6 +1479,7 @@ function parseNewlineMessage(buffer) {
   const line = buffer.slice(0, newline).toString("utf8").trim();
   return {
     message: line ? JSON.parse(line) : null,
+    framing: "newline",
     rest: buffer.slice(newline + 1),
   };
 }
@@ -1476,12 +1490,12 @@ function drainInputBuffer() {
     if (input.length === 0) return;
 
     try {
-      const parsed = startsWithContentLength(input)
-        ? parseContentLengthMessage(input)
-        : parseNewlineMessage(input);
+      const parsed = startsWithJsonMessage(input)
+        ? parseNewlineMessage(input)
+        : parseContentLengthMessage(input);
       if (!parsed) return;
       input = parsed.rest;
-      if (parsed.message) enqueueMessage(parsed.message);
+      if (parsed.message) enqueueMessage(parsed.message, parsed.framing);
     } catch (error) {
       log("parse failed", error.stack || error.message);
       input = Buffer.alloc(0);
