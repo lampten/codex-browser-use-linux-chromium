@@ -286,10 +286,10 @@ Codex Desktop remote sessions may still override MCP config via
 
 Windows Codex Desktop may send a Windows-local `node_repl` command path through
 `RefreshMcpServers`, for example a path under `AppData\\Local\\Programs` or a
-hashed app binary path under `AppData\\Local\\OpenAI\\Codex\\bin`. That path
-varies by Windows username, install channel, and app update. Install the common
-Windows stable/Beta shims and any hashed paths already seen in app-server logs
-with:
+hashed OpenAI runtime path under `AppData\\Local\\OpenAI\\Codex\\bin` or
+`AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node`. That path varies by
+Windows username, install channel, and app update. Install the common Windows
+stable/Beta shims and any hashed paths already seen in app-server logs with:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js install --windows-shims --windows-username YOUR_WINDOWS_USER
@@ -304,7 +304,9 @@ C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe
 
 and forward-slash variants like `C:/Users/Josh/.../node_repl.exe`. If Codex
 Desktop has already sent a hashed command like
-`C:\\Users\\Josh\\AppData\\Local\\OpenAI\\Codex\\bin\\3c238e29bbc930ff\\node_repl.exe`,
+`C:\\Users\\Josh\\AppData\\Local\\OpenAI\\Codex\\bin\\3c238e29bbc930ff\\node_repl.exe`
+or
+`C:\\Users\\Josh\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\a89897d3d9baa117\\bin\\node_repl.exe`,
 the installer discovers it from the last 7 days of `~/.codex/logs_2.sqlite`
 automatically. If Codex Desktop uses a custom install path that is not in the
 logs, inspect the Linux host app-server log for the exact `RefreshMcpServers`
@@ -351,9 +353,10 @@ includes the upstream Codex version, official `codex mcp list` entries for
 state. If those look correct, search
 `logs_2.sqlite` for `RefreshMcpServers` and verify the exact `node_repl.command`
 exists on the Linux host; on Windows Desktop 0.133+ this may be a hashed
-`AppData\\Local\\OpenAI\\Codex\\bin\\...\\node_repl.exe` command, so rerun
-`install --windows-shims` after the failed attempt to let the installer create
-that exact shim. Also search the logs for `skipping duplicate plugin
+`AppData\\Local\\OpenAI\\Codex\\bin\\...\\node_repl.exe` command or a
+`AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\...\\bin\\node_repl.exe`
+command, so rerun `install --windows-shims` after the failed attempt to let the
+installer create that exact shim. Also search the logs for `skipping duplicate plugin
 MCP server name`: if Chrome and Browser Use both declare `node_repl`, reinstall
 this compatibility layer so Browser Use is moved to `browser_node_repl`, then
 restart `codex app-server`. On Codex 0.130+ remote hosts, verify both

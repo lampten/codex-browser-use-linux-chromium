@@ -29,6 +29,8 @@ const WINDOWS_DESKTOP_APP_DIRS = [
 const WINDOWS_NODE_REPL_NAMES = ["node_repl.exe", "node_repl"];
 const WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE =
   /C:\\+Users\\+[^"\\]+\\+AppData\\+Local\\+OpenAI\\+(?:Codex|Codex Beta)\\+bin\\+[0-9a-fA-F]+\\+node_repl(?:\.exe)?/g;
+const WINDOWS_OPENAI_CODEX_RUNTIME_NODE_REPL_RE =
+  /C:\\+Users\\+[^"\\]+\\+AppData\\+Local\\+OpenAI\\+(?:Codex|Codex Beta)\\+runtimes\\+cua_node\\+[0-9a-fA-F]+\\+bin\\+node_repl(?:\.exe)?/g;
 const WINDOWS_NODE_REPL_LOG_MATCH_LIMIT = 250;
 const WINDOWS_NODE_REPL_LOG_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
 const WINDOWS_NODE_REPL_LOG_SCAN_TIMEOUT_MS = 10000;
@@ -2300,7 +2302,7 @@ function installDesktopShims(args, paths) {
 }
 
 function windowsNodeReplCommands(args) {
-  const commands = [...args.windowsNodeReplPaths, ...detectWindowsOpenAICodexBinNodeReplPaths(args)];
+  const commands = [...args.windowsNodeReplPaths, ...detectWindowsOpenAICodexNodeReplPaths(args)];
   for (const username of args.windowsUsernames) {
     for (const appDir of WINDOWS_DESKTOP_APP_DIRS) {
       for (const replName of WINDOWS_NODE_REPL_NAMES) {
@@ -2312,7 +2314,7 @@ function windowsNodeReplCommands(args) {
   return uniqueStrings(commands);
 }
 
-function detectWindowsOpenAICodexBinNodeReplPaths(args) {
+function detectWindowsOpenAICodexNodeReplPaths(args) {
   const sqlite = commandPath("sqlite3");
   if (!sqlite) return [];
   const logsDb = path.join(args.codexHome, "logs_2.sqlite");
@@ -2320,7 +2322,7 @@ function detectWindowsOpenAICodexBinNodeReplPaths(args) {
   const query = [
     "select feedback_log_body from logs",
     `where ts >= strftime('%s','now','-${WINDOWS_NODE_REPL_LOG_LOOKBACK_SECONDS} seconds')`,
-    "and feedback_log_body like '%node_repl%Object%command%String%C:%AppData%Local%OpenAI%Codex%bin%node_repl%'",
+    "and feedback_log_body like '%node_repl%Object%command%String%C:%AppData%Local%OpenAI%Codex%node_repl%'",
     `order by id desc limit ${WINDOWS_NODE_REPL_LOG_MATCH_LIMIT};`,
   ].join(" ");
   const result = childProcess.spawnSync(sqlite, ["-readonly", "-batch", "-noheader", logsDb, query], {
@@ -2330,7 +2332,10 @@ function detectWindowsOpenAICodexBinNodeReplPaths(args) {
   });
   if (result.error || result.status !== 0) return [];
   return uniqueStrings(
-    [...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE)]
+    [
+      ...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE),
+      ...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_RUNTIME_NODE_REPL_RE),
+    ]
       .filter((match) => windowsOpenAICodexBinNodeReplLogContextMatches(result.stdout, match.index))
       .map((match) => match[0].replace(/\\+/g, "\\"))
   );
