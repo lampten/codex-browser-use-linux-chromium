@@ -29,6 +29,9 @@ const WINDOWS_DESKTOP_APP_DIRS = [
 const WINDOWS_NODE_REPL_NAMES = ["node_repl.exe", "node_repl"];
 const WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE =
   /C:\\+Users\\+[^"\\]+\\+AppData\\+Local\\+OpenAI\\+(?:Codex|Codex Beta)\\+bin\\+[0-9a-fA-F]+\\+node_repl(?:\.exe)?/g;
+const WINDOWS_NODE_REPL_LOG_MATCH_LIMIT = 250;
+const WINDOWS_NODE_REPL_LOG_LOOKBACK_SECONDS = 7 * 24 * 60 * 60;
+const WINDOWS_NODE_REPL_LOG_SCAN_TIMEOUT_MS = 10000;
 
 function usage() {
   console.log(`Usage:
@@ -243,30 +246,182 @@ function processExists(pid) {
   }
 }
 
+function processState(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const afterCommand = stat.slice(stat.lastIndexOf(")") + 2);
+    return afterCommand.split(/\s+/)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function processIsLiveNonZombie(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || !processExists(pid)) return false;
+  return processState(pid) !== "Z";
+}
+
+function processParentPid(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const afterCommand = stat.slice(stat.lastIndexOf(")") + 2);
+    const fields = afterCommand.split(/\s+/);
+    const ppid = Number(fields[1]);
+    return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
+function processCommandArgs(pid) {
+  try {
+    return fs
+      .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .split("\0")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function chromiumSingletonPidFromTarget(target) {
+  const match = String(target || "").match(/-(\d+)$/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function chromiumDefaultProfilePid(userDataDir) {
+  const lockPath = path.join(userDataDir, "SingletonLock");
+  if (!fs.existsSync(lockPath)) return null;
+  let target;
+  try {
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return null;
+  }
+  const pid = chromiumSingletonPidFromTarget(target);
+  return processIsLiveNonZombie(pid) ? pid : null;
+}
+
+function socketPidFromPath(socketPath) {
+  const match = path.basename(String(socketPath || "")).match(/^chromium-(\d+)\.sock$/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function userDataDirFromCommandArgs(args) {
+  const match = commandLineText(args).match(/(?:^|\s)--user-data-dir=(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  return match ? match[1] || match[2] || match[3] || null : null;
+}
+
+function commandLineText(args) {
+  return args.join(" ");
+}
+
+function commandLineHasFlag(args, flag) {
+  const text = ` ${commandLineText(args)} `;
+  return text.includes(` ${flag} `) || text.includes(` ${flag}=`);
+}
+
+function isTemporaryUserDataDir(userDataDir) {
+  if (!userDataDir) return false;
+  const resolved = path.resolve(userDataDir);
+  const tmp = path.resolve(os.tmpdir());
+  return resolved === tmp || resolved.startsWith(`${tmp}${path.sep}`);
+}
+
+function browserUseSocketCandidate(socketPath, userDataDir, defaultProfilePid) {
+  const pid = socketPidFromPath(socketPath);
+  let isSocket = false;
+  try {
+    isSocket = fs.statSync(socketPath).isSocket();
+  } catch {
+    // Ignore races while Chromium or the native host starts/exits.
+  }
+
+  const ownerProcessAlive = processIsLiveNonZombie(pid);
+  const browserPid = ownerProcessAlive ? processParentPid(pid) : null;
+  const browserProcessAlive = processIsLiveNonZombie(browserPid);
+  const browserArgs = browserProcessAlive ? processCommandArgs(browserPid) : [];
+  const browserUserDataDir = userDataDirFromCommandArgs(browserArgs);
+  const browserCommandLine = commandLineText(browserArgs);
+  const headless =
+    commandLineHasFlag(browserArgs, "--headless") ||
+    browserCommandLine.includes("--ozone-platform=headless");
+  const incognito = commandLineHasFlag(browserArgs, "--incognito");
+  const temporaryProfile = isTemporaryUserDataDir(browserUserDataDir);
+  const defaultProfile =
+    browserPid != null &&
+    (browserPid === defaultProfilePid ||
+      (browserUserDataDir != null && path.resolve(browserUserDataDir) === path.resolve(userDataDir)) ||
+      (browserUserDataDir == null && !headless));
+
+  let score = 0;
+  const reasons = [];
+  if (ownerProcessAlive) score += 100;
+  if (browserProcessAlive) score += 100;
+  if (defaultProfilePid != null && browserPid === defaultProfilePid) {
+    score += 1000;
+    reasons.push("default-profile-singleton");
+  } else if (defaultProfile) {
+    score += 600;
+    reasons.push("default-profile");
+  }
+  if (browserCommandLine.includes("--load-extension=")) {
+    score += 50;
+    reasons.push("codex-extension-loaded");
+  }
+  if (headless) {
+    score -= 800;
+    reasons.push("headless");
+  }
+  if (temporaryProfile) {
+    score -= 700;
+    reasons.push("temporary-profile");
+  }
+  if (incognito) {
+    score -= 300;
+    reasons.push("incognito");
+  }
+
+  return {
+    path: socketPath,
+    pid,
+    isSocket,
+    ownerProcessAlive,
+    stale: isSocket && !ownerProcessAlive,
+    browserPid,
+    browserProcessAlive,
+    userDataDir: browserUserDataDir,
+    defaultProfile,
+    headless,
+    temporaryProfile,
+    incognito,
+    score,
+    reasons,
+  };
+}
+
 function browserUseSocketStatus(socketDir = DEFAULT_SOCKET_DIR) {
   if (!fs.existsSync(socketDir)) return [];
-  return fs
+  const userDataDir = path.join(os.homedir(), ".config", "chromium");
+  const defaultProfilePid = chromiumDefaultProfilePid(userDataDir);
+  const sockets = fs
     .readdirSync(socketDir)
     .filter((entry) => /^chromium-\d+\.sock$/.test(entry))
     .sort()
-    .map((entry) => {
-      const socketPath = path.join(socketDir, entry);
-      const pid = Number(entry.match(/^chromium-(\d+)\.sock$/)[1]);
-      let isSocket = false;
-      try {
-        isSocket = fs.statSync(socketPath).isSocket();
-      } catch {
-        // Treat races as non-socket entries; doctor is advisory.
-      }
-      const ownerProcessAlive = processExists(pid);
-      return {
-        path: socketPath,
-        pid,
-        isSocket,
-        ownerProcessAlive,
-        stale: isSocket && !ownerProcessAlive,
-      };
-    });
+    .map((entry) =>
+      browserUseSocketCandidate(path.join(socketDir, entry), userDataDir, defaultProfilePid)
+    );
+  const bestScore = sockets
+    .filter((socket) => socket.isSocket && socket.ownerProcessAlive)
+    .reduce((score, socket) => Math.max(score, socket.score), Number.NEGATIVE_INFINITY);
+  return sockets.map((socket) => ({
+    ...socket,
+    preferred: socket.isSocket && socket.ownerProcessAlive && socket.score === bestScore,
+  }));
 }
 
 function chromiumUserDataDir(args) {
@@ -489,6 +644,30 @@ function parseCodexPluginList(text) {
   return entries;
 }
 
+function parseCodexPluginJsonList(value) {
+  const entries = [];
+  for (const plugin of [...(value?.installed || []), ...(value?.available || [])]) {
+    if (!plugin || typeof plugin !== "object") continue;
+    const id =
+      typeof plugin.pluginId === "string"
+        ? plugin.pluginId
+        : plugin.name && plugin.marketplaceName
+          ? `${plugin.name}@${plugin.marketplaceName}`
+          : null;
+    if (!id) continue;
+    const installed = Boolean(plugin.installed);
+    entries.push({
+      id,
+      marketplace: plugin.marketplaceName || null,
+      marketplacePath: null,
+      states: installed ? ["installed", plugin.enabled ? "enabled" : "disabled"] : ["not installed"],
+      version: plugin.version || null,
+      path: typeof plugin.source?.path === "string" ? plugin.source.path : null,
+    });
+  }
+  return entries;
+}
+
 function parseCodexPluginTableStatus(text) {
   for (const statusText of ["installed, enabled", "installed, disabled", "not installed"]) {
     if (text === statusText) {
@@ -514,12 +693,18 @@ function parseCodexPluginTableStatus(text) {
 }
 
 function summarizeCodexPluginList(commandResult) {
-  const entries = commandResult.ok ? parseCodexPluginList(commandResult.stdout) : [];
+  const parsed = commandResult.ok ? parseJsonOutput(commandResult.stdout) : { value: null, error: null };
+  const entries = commandResult.ok
+    ? parsed.value
+      ? parseCodexPluginJsonList(parsed.value)
+      : parseCodexPluginList(commandResult.stdout)
+    : [];
   const relevantPlugins = entries.filter((entry) =>
     ["browser-use@openai-bundled", "chrome@openai-bundled"].includes(entry.id)
   );
   return {
     command: commandResult.command,
+    format: parsed.value ? "json" : "table",
     ok: commandResult.ok,
     status: commandResult.status,
     signal: commandResult.signal,
@@ -528,6 +713,24 @@ function summarizeCodexPluginList(commandResult) {
     stderr: trimCommandOutput(commandResult.stderr),
     relevantPlugins,
   };
+}
+
+function runCodexPluginList(codexPath) {
+  const jsonResult = runCapturedCommand(codexPath, ["plugin", "list", "--available", "--json"], 10000);
+  if (jsonResult.ok) return summarizeCodexPluginList(jsonResult);
+
+  const tableSummary = summarizeCodexPluginList(
+    runCapturedCommand(codexPath, ["plugin", "list"], 10000)
+  );
+  tableSummary.fallbackFrom = {
+    command: jsonResult.command,
+    status: jsonResult.status,
+    signal: jsonResult.signal,
+    timedOut: jsonResult.timedOut,
+    error: jsonResult.error,
+    stderr: trimCommandOutput(jsonResult.stderr),
+  };
+  return tableSummary;
 }
 
 function pluginMarketplaceForRoot(root) {
@@ -575,7 +778,7 @@ function formatPluginInstallInfo(info) {
 function currentCodexPluginList() {
   const codexPath = resolveCodexPath();
   if (!codexPath) return null;
-  return summarizeCodexPluginList(runCapturedCommand(codexPath, ["plugin", "list"], 10000));
+  return runCodexPluginList(codexPath);
 }
 
 function installedPluginEntry(pluginList, id) {
@@ -712,9 +915,9 @@ function upstreamCodexStatus(codexPath, paths) {
   };
   if (!codexPath) return status;
 
-  status.doctor = summarizeCodexDoctor(runCapturedCommand(codexPath, ["doctor", "--json"], 20000));
+  status.doctor = summarizeCodexDoctor(runCapturedCommand(codexPath, ["doctor", "--json"], 5000));
   status.mcpList = summarizeCodexMcpList(runCapturedCommand(codexPath, ["mcp", "list"], 10000), paths);
-  status.pluginList = summarizeCodexPluginList(runCapturedCommand(codexPath, ["plugin", "list"], 10000));
+  status.pluginList = runCodexPluginList(codexPath);
   return status;
 }
 
@@ -1081,6 +1284,12 @@ const BROWSER_CLIENT_INPUT_PASTE_FALLBACK_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-client-input-paste-fallback";
 const NODE_REPL_CHROMIUM_AUTOSTART_MARKER =
   "codex-browser-use-linux-chromium: node-repl-chromium-extension-autostart";
+const NODE_REPL_CHROMIUM_FOREGROUND_SOCKET_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-foreground-socket-selection";
+const NODE_REPL_IDLE_BROWSER_CLEANUP_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-idle-browser-cleanup";
+const NODE_REPL_CHROMIUM_PASSWORD_STORE_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-password-store-basic";
 
 function patchBrowserClientFastVisibleScreenshots(text) {
   if (text.includes(BROWSER_CLIENT_FAST_VISIBLE_SCREENSHOT_PATCH_MARKER)) return text;
@@ -1500,7 +1709,19 @@ function resolveLinuxNativeHostManifestPath() {
 
 function patchOpenChromeWindow(text) {
   let output = patchLinuxUserDataDirectory(text);
-  if (output.includes('commandPath("chromium")')) return output;
+  if (output.includes('commandPath("chromium")')) {
+    if (output.includes('args: ["--password-store=basic", ...chromeArgs]')) return output;
+    return replaceRequired(
+      output,
+      `    command: linuxChromeCommand,
+    args: chromeArgs,
+  };`,
+      `    command: linuxChromeCommand,
+    args: ["--password-store=basic", ...chromeArgs],
+  };`,
+      "Linux Chromium password store launch flag"
+    );
+  }
   const linuxLaunchBlock = /  return \{\r?\n    command: "google-chrome",\r?\n    args: chromeArgs,\r?\n  \};/;
   if (!linuxLaunchBlock.test(output)) {
     throw new Error("Could not find patch point for Linux Chromium launch command");
@@ -1514,7 +1735,7 @@ function patchOpenChromeWindow(text) {
     "google-chrome";
   return {
     command: linuxChromeCommand,
-    args: chromeArgs,
+    args: ["--password-store=basic", ...chromeArgs],
   };`
   );
 }
@@ -1543,10 +1764,18 @@ const CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-command-scoping";
 const TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER =
   "codex-browser-use-linux-chromium: tab-info-handle-guidance";
+const AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: agent-browsers-list-guidance";
+const EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: extension-backend-reuse-guidance";
 const SUPPORTED_EXTRACTION_GUIDANCE =
   "does not expose `evaluate`, `page.evaluate`, or `locator(...).evaluateAll()`";
 const TAB_INFO_HANDLE_GUIDANCE =
   "`browser.tabs.list()` and `browser.user.openTabs()` return info objects, not controllable `Tab` handles. Do not call `goto()`, `url()`, `title()`, `playwright`, `cua`, `close()`, or other tab methods on those objects. For a current session tab, pick the `TabInfo`, then run `const tab = await browser.tabs.get(info.id)` and use that returned `Tab`. For a user browser tab from `openTabs()`, pass the returned object to `const tab = await browser.user.claimTab(info)` and use the claimed `Tab`.";
+const AGENT_BROWSERS_LIST_GUIDANCE =
+  "`agent.browsers` is a registry object, not an array. Do not call `agent.browsers.map(...)`, spread it, or iterate it directly. Use `const browsers = await agent.browsers.list();` before array operations such as `browsers.map(...)`, or use `await agent.browsers.get(\"extension\")` to select Chromium directly.";
+const EXTENSION_BACKEND_REUSE_GUIDANCE =
+  "When a task depends on the user's logged-in or foreground browser state, start with `browser.user.openTabs()` and claim the matching user tab with `browser.user.claimTab(info)` instead of opening a fresh tab first. The Linux runtime filters lower-priority headless or temporary-profile Chromium sockets when a default-profile foreground socket is present; do not work around that by launching a separate Chromium profile.";
 
 function patchBrowserSkill(text) {
   text = text.replace(
@@ -1574,7 +1803,11 @@ function patchBrowserSkill(text) {
     text.includes("Do not run a lightweight tab check after a timeout/reset") &&
     text.includes(SUPPORTED_EXTRACTION_GUIDANCE) &&
     text.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
-    text.includes(TAB_INFO_HANDLE_GUIDANCE)
+    text.includes(TAB_INFO_HANDLE_GUIDANCE) &&
+    text.includes(AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER) &&
+    text.includes(AGENT_BROWSERS_LIST_GUIDANCE) &&
+    text.includes(EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER) &&
+    text.includes(EXTENSION_BACKEND_REUSE_GUIDANCE)
   ) {
     return text;
   }
@@ -1650,6 +1883,14 @@ Before ending a Browser task, call \`browser_cleanup\` from the same MCP server 
 <!-- ${TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER} -->
 
 ${TAB_INFO_HANDLE_GUIDANCE}
+
+<!-- ${AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER} -->
+
+${AGENT_BROWSERS_LIST_GUIDANCE}
+
+<!-- ${EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER} -->
+
+${EXTENSION_BACKEND_REUSE_GUIDANCE}
 
 Screenshots and \`domSnapshot()\` are supported Browser capabilities on Linux Chromium. Use them when the task needs visual evidence or a full accessibility snapshot; do not silently replace a requested screenshot with text-only output.
 
@@ -1745,7 +1986,11 @@ function patchChromeSkill(text) {
     text.includes("Do not run a lightweight tab check after a timeout/reset") &&
     text.includes(SUPPORTED_EXTRACTION_GUIDANCE) &&
     text.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
-    text.includes(TAB_INFO_HANDLE_GUIDANCE)
+    text.includes(TAB_INFO_HANDLE_GUIDANCE) &&
+    text.includes(AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER) &&
+    text.includes(AGENT_BROWSERS_LIST_GUIDANCE) &&
+    text.includes(EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER) &&
+    text.includes(EXTENSION_BACKEND_REUSE_GUIDANCE)
   ) {
     return text;
   }
@@ -1791,6 +2036,14 @@ Before ending a Chrome task, call \`browser_cleanup\` from \`node_repl\` when it
 <!-- ${TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER} -->
 
 ${TAB_INFO_HANDLE_GUIDANCE}
+
+<!-- ${AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER} -->
+
+${AGENT_BROWSERS_LIST_GUIDANCE}
+
+<!-- ${EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER} -->
+
+${EXTENSION_BACKEND_REUSE_GUIDANCE}
 
 ## Screenshot Output Compatibility
 
@@ -2066,19 +2319,27 @@ function detectWindowsOpenAICodexBinNodeReplPaths(args) {
   if (!fs.existsSync(logsDb)) return [];
   const query = [
     "select feedback_log_body from logs",
-    "where feedback_log_body like '%AppData%Local%OpenAI%Codex%bin%node_repl%'",
-    "order by id desc limit 250;",
+    `where ts >= strftime('%s','now','-${WINDOWS_NODE_REPL_LOG_LOOKBACK_SECONDS} seconds')`,
+    "and feedback_log_body like '%node_repl%Object%command%String%C:%AppData%Local%OpenAI%Codex%bin%node_repl%'",
+    `order by id desc limit ${WINDOWS_NODE_REPL_LOG_MATCH_LIMIT};`,
   ].join(" ");
-  const result = childProcess.spawnSync(sqlite, ["-batch", "-noheader", logsDb, query], {
+  const result = childProcess.spawnSync(sqlite, ["-readonly", "-batch", "-noheader", logsDb, query], {
     encoding: "utf8",
     maxBuffer: 8 * 1024 * 1024,
+    timeout: WINDOWS_NODE_REPL_LOG_SCAN_TIMEOUT_MS,
   });
   if (result.error || result.status !== 0) return [];
   return uniqueStrings(
-    [...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE)].map((match) =>
-      match[0].replace(/\\+/g, "\\")
-    )
+    [...result.stdout.matchAll(WINDOWS_OPENAI_CODEX_BIN_NODE_REPL_RE)]
+      .filter((match) => windowsOpenAICodexBinNodeReplLogContextMatches(result.stdout, match.index))
+      .map((match) => match[0].replace(/\\+/g, "\\"))
   );
+}
+
+function windowsOpenAICodexBinNodeReplLogContextMatches(text, index) {
+  if (!Number.isInteger(index) || index < 0) return false;
+  const prefix = text.slice(Math.max(0, index - 240), index);
+  return /"node_repl"\s*:\s*Object\s*\{\s*"command"\s*:\s*String\("$/s.test(prefix);
 }
 
 function userPathShimDirs() {
@@ -2373,6 +2634,12 @@ function patchStatusForRoot(root, paths) {
       browserSkillTabInfoHandleGuidance:
         browserSkill.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
         browserSkill.includes(TAB_INFO_HANDLE_GUIDANCE),
+      browserSkillAgentBrowsersListGuidance:
+        browserSkill.includes(AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER) &&
+        browserSkill.includes(AGENT_BROWSERS_LIST_GUIDANCE),
+      browserSkillExtensionBackendReuseGuidance:
+        browserSkill.includes(EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER) &&
+        browserSkill.includes(EXTENSION_BACKEND_REUSE_GUIDANCE),
       browserSkillChromiumAutostart:
         browserSkill.includes(BROWSER_SKILL_CHROMIUM_AUTOSTART_PATCH_MARKER) &&
         browserSkill.includes("ensureChromiumExtensionReady"),
@@ -2409,6 +2676,8 @@ function patchStatusForRoot(root, paths) {
       ),
     openWindowChromium:
       /commandPath\("chromium"\)[\s\S]*command:\s*linuxChromeCommand/.test(openWindow),
+    openWindowPasswordStore:
+      /args:\s*\[\s*"--password-store=basic",\s*...chromeArgs\s*\]/.test(openWindow),
     chromeSkillNodeReplDiscovery: chromeSkill.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER),
     chromeSkillScreenshotOutput:
       chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
@@ -2419,6 +2688,12 @@ function patchStatusForRoot(root, paths) {
     chromeSkillTabInfoHandleGuidance:
       chromeSkill.includes(TAB_INFO_HANDLE_GUIDANCE_PATCH_MARKER) &&
       chromeSkill.includes(TAB_INFO_HANDLE_GUIDANCE),
+    chromeSkillAgentBrowsersListGuidance:
+      chromeSkill.includes(AGENT_BROWSERS_LIST_GUIDANCE_PATCH_MARKER) &&
+      chromeSkill.includes(AGENT_BROWSERS_LIST_GUIDANCE),
+    chromeSkillExtensionBackendReuseGuidance:
+      chromeSkill.includes(EXTENSION_BACKEND_REUSE_GUIDANCE_PATCH_MARKER) &&
+      chromeSkill.includes(EXTENSION_BACKEND_REUSE_GUIDANCE),
   };
 }
 
@@ -2538,7 +2813,12 @@ function doctor(args) {
     },
     runtime: {
       nativeHostBridge: { path: paths.nativeHostBridge, exists: fs.existsSync(paths.nativeHostBridge) },
-      nodeReplMcp: runtimeFileStatus(paths.nodeReplMcp, [NODE_REPL_CHROMIUM_AUTOSTART_MARKER]),
+      nodeReplMcp: runtimeFileStatus(paths.nodeReplMcp, [
+        NODE_REPL_CHROMIUM_AUTOSTART_MARKER,
+        NODE_REPL_CHROMIUM_FOREGROUND_SOCKET_MARKER,
+        NODE_REPL_IDLE_BROWSER_CLEANUP_MARKER,
+        NODE_REPL_CHROMIUM_PASSWORD_STORE_MARKER,
+      ]),
     },
     nativeHostManifests: userNativeManifestPaths(args).map((manifestPath) =>
       nativeManifestStatus(manifestPath, paths.nativeHostBridge)
@@ -2580,7 +2860,11 @@ function doctor(args) {
     const upstreamDoctor = report.upstreamCodex.doctor;
     const checks = upstreamDoctor.checks || {};
     console.log(
-      `codex doctor: ${upstreamDoctor.overallStatus || "unknown"} version=${upstreamDoctor.codexVersion || "unknown"} config=${checks.configLoad || "unknown"} mcp=${checks.mcpConfig || "unknown"} terminal=${checks.terminalEnv || "unknown"}`
+      `codex doctor: ${
+        upstreamDoctor.timedOut ? "timeout" : upstreamDoctor.overallStatus || "unknown"
+      } version=${upstreamDoctor.codexVersion || "unknown"} config=${checks.configLoad || "unknown"} mcp=${
+        checks.mcpConfig || "unknown"
+      } terminal=${checks.terminalEnv || "unknown"}`
     );
   }
   if (report.upstreamCodex.mcpList) {
@@ -2630,6 +2914,14 @@ function doctor(args) {
       report.runtime.nodeReplMcp.exists ? "ok" : "missing"
     } chromium_autostart=${
       report.runtime.nodeReplMcp.markers[NODE_REPL_CHROMIUM_AUTOSTART_MARKER] ? "ok" : "missing"
+    } foreground_socket=${
+      report.runtime.nodeReplMcp.markers[NODE_REPL_CHROMIUM_FOREGROUND_SOCKET_MARKER]
+        ? "ok"
+        : "missing"
+    } idle_cleanup=${
+      report.runtime.nodeReplMcp.markers[NODE_REPL_IDLE_BROWSER_CLEANUP_MARKER] ? "ok" : "missing"
+    } password_store=${
+      report.runtime.nodeReplMcp.markers[NODE_REPL_CHROMIUM_PASSWORD_STORE_MARKER] ? "ok" : "missing"
     }`
   );
   console.log(
@@ -2669,7 +2961,11 @@ function doctor(args) {
   }
   for (const socket of report.browserUseSockets) {
     console.log(
-      `socket: ${socket.stale ? "stale" : "ok"} ${socket.path} pid=${socket.pid} alive=${socket.ownerProcessAlive}`
+      `socket: ${socket.preferred ? "preferred" : socket.stale ? "stale" : "ok"} ${
+        socket.path
+      } pid=${socket.pid} browser_pid=${socket.browserPid || "unknown"} score=${socket.score} reasons=${
+        socket.reasons.join(",") || "none"
+      }`
     );
   }
   for (const root of report.pluginRoots) {

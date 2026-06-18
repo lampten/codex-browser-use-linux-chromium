@@ -16,8 +16,8 @@ Windows can send a stable install path such as
 Codex 0.133-style hashed app binary path such as
 `C:\Users\Josh\AppData\Local\OpenAI\Codex\bin\3c238e29bbc930ff\node_repl.exe`.
 The installer can create Linux-side shims for these families, and it discovers
-hashed Windows paths from `~/.codex/logs_2.sqlite` after the app-server has seen
-one in `RefreshMcpServers`.
+hashed Windows paths by scanning the last 7 days of `~/.codex/logs_2.sqlite`
+after the app-server has seen one in `RefreshMcpServers`.
 
 This project fills the Linux side:
 
@@ -48,11 +48,14 @@ The installer manages the flag by Codex version:
 tool_search_always_defer_mcp_tools = false
 ```
 
-On Codex 0.133+, `false` keeps small MCP tool sets directly visible, which
-avoids Desktop remote sessions where `node_repl` starts successfully but the
-remote `tool_search` index omits it. On Codex 0.130-0.132, the installer keeps
-the older `true` setting because those versions needed `node_repl/js` and
-`node_repl/js_reset` to be discoverable through `tool_search`. The same runtime also exposes
+On Codex 0.133+ through the current tested CLI (`0.137.0`), `false` keeps small
+MCP tool sets directly visible, which avoids Desktop remote sessions where
+`node_repl` starts successfully but the remote `tool_search` index omits it. On
+Codex 0.130-0.132, the installer keeps the older `true` setting because those
+versions needed `node_repl/js` and `node_repl/js_reset` to be discoverable
+through `tool_search`. Codex 0.135+ reports the old `js_repl` feature as
+removed, so this project continues to provide its own MCP `node_repl` server
+instead of trying to revive the built-in REPL. The same runtime also exposes
 `browser_cleanup`, a small tool that runs Browser Use tab finalization for the
 current session without requiring an arbitrary JavaScript cleanup cell. `doctor`
 reports the flag separately from native-host and plugin-cache status so a
@@ -89,6 +92,11 @@ bridge-specific checks. The upstream doctor can prove the active Codex install,
 config parser, update state, and effective MCP registry; only this project's
 doctor can verify the Chromium extension patch, native host manifests, live
 Browser Use sockets, and local plugin-cache rewrites.
+
+Codex 0.137 adds structured `codex plugin list --available --json` output.
+This project uses it when available so installed Chrome and available Browser
+Use plugin roots are matched by explicit `pluginId` and `source.path`; older
+Codex builds still use the table parser fallback.
 
 ## Browser vs Chrome Routing
 
@@ -179,6 +187,26 @@ objects for selection and inspection. Browser actions such as `goto()`,
 by `browser.tabs.new()`, `browser.tabs.selected()`, `browser.tabs.get(info.id)`,
 or `browser.user.claimTab(info)`.
 
+Browser discovery uses the same boundary. `agent.browsers` is a registry object,
+not an array; callers must use `await agent.browsers.list()` before array
+operations like `map()`, or `await agent.browsers.get("extension")` when they
+already need the Chromium extension backend.
+
+On a long-lived Linux desktop, more than one extension native-host socket can be
+alive at the same time. The compatibility `node_repl` ranks those sockets before
+the official Browser client connects: the Chromium process that owns the
+default-profile `SingletonLock` is preferred, while headless, incognito, and
+temporary-profile sockets are downgraded. This keeps logged-in foreground
+browser state ahead of old automation Chromium instances without killing those
+processes. Set `CODEX_BROWSER_USE_CHROMIUM_SOCKET_SELECTION=all` to disable the
+filter for diagnostics.
+
+Chromium is launched with `--password-store=basic` on Linux. On this host,
+letting Chromium auto-detect the desktop password backend can leave the
+persistent cookie store stuck during the first key load, which prevents normal
+HTTP/HTTPS main-frame navigation from committing even though the extension
+bridge itself is alive.
+
 After a timeout, the compatibility runtime destroys native browser pipe sockets
 and resets the JS context by default; this prevents the timed-out Browser Use
 promise from continuing to occupy the extension channel while later calls run.
@@ -263,6 +291,14 @@ tabs owned by the current session group and leaves unrelated user tabs alone.
 MCP process shutdown runs it once more as a best-effort exit hook. These paths
 are bounded by `CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS` so cleanup cannot
 become another long-hanging browser command.
+
+Long-lived app-server MCP workers may not exit at the end of a user-visible
+turn. To cover agents that forget to finalize tabs, the runtime schedules an
+idle cleanup after each JS call. The default idle window is
+`CODEX_NODE_REPL_IDLE_BROWSER_CLEANUP_MS=600000`; set it to `0` to disable the
+timer. When idle cleanup succeeds, the JS context is discarded so any later
+browser work has to bootstrap a fresh `browser`/`tab` binding instead of using a
+closed tab handle.
 
 The runtime also records when the JS context has already successfully requested
 `browser.tabs.finalize(...)`. That prevents the reset/exit hooks from running a

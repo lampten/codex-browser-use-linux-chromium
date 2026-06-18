@@ -22,6 +22,11 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
   Chromium profile when a fresh Codex conversation reaches Browser setup before
   any extension-backed browser session is online. It waits for the extension's
   native-host socket before the Browser skill retries `agent.browsers.get`.
+- When several Chromium extension sockets are alive, prefers the foreground
+  default-profile Chromium socket over headless, incognito, or temporary-profile
+  sockets so logged-in browser state wins backend discovery.
+- Launches Linux Chromium with `--password-store=basic` so cookie-store startup
+  does not block HTTP/HTTPS page navigation behind a desktop keyring backend.
 - Provides `nodeRepl.import()` and `__dynamicImport()` for relative imports
   resolved from the REPL cwd.
 - Saves emitted browser images to absolute files under the current workspace
@@ -52,7 +57,9 @@ the runtime shape expected by the official Codex Chrome/Browser Use skill.
 - Exposes a dedicated `browser_cleanup` MCP tool that calls the official
   Browser Use session finalizer with `keep: []`, so agents can close task tabs
   without running arbitrary cleanup JavaScript. `js_reset` and normal MCP
-  process shutdown also best-effort run the same cleanup.
+  process shutdown also best-effort run the same cleanup. Long-lived MCP
+  processes also run an idle cleanup timer so forgotten task tabs do not sit in
+  Chromium indefinitely.
 - Restarts the native host bridge when a client disconnects with an in-flight
   browser command, which clears orphaned screenshot/DOM commands that can later
   surface as `Detached while handling command`.
@@ -183,8 +190,8 @@ node bin/codex-browser-use-linux-chromium.js doctor
   `C:\\Users\\<name>\\AppData\\Local\\Programs\\...\\resources\\node_repl.exe`.
   The installer generates both the local Linux username and a capitalized
   variant; pass `--windows-username NAME` when the Windows account name differs.
-  It also scans `~/.codex/logs_2.sqlite` for recent Codex 0.133-style hashed
-  paths such as
+  It also scans the last 7 days of `~/.codex/logs_2.sqlite` for Codex
+  0.133-style hashed paths such as
   `C:\\Users\\<name>\\AppData\\Local\\OpenAI\\Codex\\bin\\<hash>\\node_repl.exe`
   and creates shims for the exact commands it finds.
   Backslash-form Windows commands are installed into both `~/.local/bin` and
@@ -217,11 +224,14 @@ passed:
 tool_search_always_defer_mcp_tools = false
 ```
 
-For Codex 0.133+, `false` keeps small MCP tool sets directly callable. This
-avoids Desktop remote sessions that can start `node_repl` but fail to include it
-in the remote `tool_search` index. For Codex 0.130-0.132, the installer keeps
-the older `true` behavior because those versions relied on `tool_search` for
-Chrome/Browser skill discovery.
+For Codex 0.133+ through the current tested CLI (`0.137.0`), `false` keeps
+small MCP tool sets directly callable. This avoids Desktop remote sessions that
+can start `node_repl` but fail to include it in the remote `tool_search` index.
+For Codex 0.130-0.132, the installer keeps the older `true` behavior because
+those versions relied on `tool_search` for Chrome/Browser skill discovery.
+Codex 0.135+ marks the old `js_repl` feature as removed, so this compatibility
+layer should continue to expose `node_repl` through MCP rather than trying to
+restore the removed built-in REPL.
 
 Codex 0.130 also de-duplicates plugin MCP servers by name. If both the Chrome
 and Browser Use plugin caches declare `node_repl`, the first loaded plugin can
@@ -251,6 +261,11 @@ state. `install` and `patch-plugin` also recreate the installed bundled plugin
 `latest` cache alias when Codex has only left a versioned directory such as
 `chrome/0.1.7`; without that alias, `@chrome` may disappear from skill
 discovery even though the Chrome plugin is still installed and enabled.
+
+Codex 0.137 adds `codex plugin list --json` and `--available --json`. This
+project's `doctor` prefers that structured output and falls back to the table
+output for older Codex builds; the plugin manifest and `.mcp.json` patch format
+remain unchanged.
 
 For direct Codex CLI usage, also add:
 
@@ -290,10 +305,10 @@ C:\Users\Josh\AppData\Local\Programs\Codex Beta\resources\node_repl.exe
 and forward-slash variants like `C:/Users/Josh/.../node_repl.exe`. If Codex
 Desktop has already sent a hashed command like
 `C:\\Users\\Josh\\AppData\\Local\\OpenAI\\Codex\\bin\\3c238e29bbc930ff\\node_repl.exe`,
-the installer discovers it from `~/.codex/logs_2.sqlite` automatically. If
-Codex Desktop uses a custom install path that is not in the logs, inspect the
-Linux host app-server log for the exact `RefreshMcpServers` `node_repl.command`
-value and pass it explicitly:
+the installer discovers it from the last 7 days of `~/.codex/logs_2.sqlite`
+automatically. If Codex Desktop uses a custom install path that is not in the
+logs, inspect the Linux host app-server log for the exact `RefreshMcpServers`
+`node_repl.command` value and pass it explicitly:
 
 ```bash
 node bin/codex-browser-use-linux-chromium.js install --windows-shims \
@@ -393,6 +408,17 @@ on those list results. Reacquire a current-session tab with
 `await browser.tabs.get(info.id)`, or claim a user tab with
 `await browser.user.claimTab(info)`, then call `goto()` on the returned `Tab`.
 
+`agent.browsers` is also not an array. It is a registry object with async
+`list()` and `get()` methods. Use
+`const browsers = await agent.browsers.list();` before `browsers.map(...)`, or
+use `await agent.browsers.get("extension")` to select Chromium directly.
+
+If multiple extension sockets exist, the `node_repl` native-pipe shim scores
+them before connection. The Chromium process that owns the default profile
+singleton wins over headless, incognito, or `/tmp` user-data-dir sessions. Set
+`CODEX_BROWSER_USE_CHROMIUM_SOCKET_SELECTION=all` only when you explicitly need
+to expose every live socket to the Browser client.
+
 If a call fails with `native pipe is closed`, `Detached while handling command`, or
 `Timed out after ... waiting for CDP command`, the REPL resets its stale browser
 context by default; run `js_reset`, re-bootstrap, create a new tab, and navigate
@@ -404,14 +430,16 @@ If Chromium accumulates tabs from Browser/Chrome tasks, use the `browser_cleanup
 MCP tool on the same `node_repl`/`browser_node_repl` server. It runs the Browser
 Use tab finalizer for the current session with `keep: []`; it does not close
 arbitrary user tabs. The runtime also best-effort runs that cleanup before
-`js_reset` and when the MCP process exits. If the same JS context already ran
-`browser.tabs.finalize(...)` directly, including a deliberate handoff or
-deliverable keep list, those automatic cleanup paths skip the second finalizer
-call. Set
+`js_reset`, when the MCP process exits, and after an idle period in a long-lived
+MCP process. If the same JS context already ran `browser.tabs.finalize(...)`
+directly, including a deliberate handoff or deliverable keep list, those
+automatic cleanup paths skip the second finalizer call. Set
 `CODEX_NODE_REPL_CLEANUP_TABS_ON_RESET=0` or
 `CODEX_NODE_REPL_CLEANUP_TABS_ON_EXIT=0` to disable those automatic cleanup
 paths, and tune the cleanup wait with
-`CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS` (default 3000).
+`CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS` (default 3000). Tune or disable the
+idle cleanup with `CODEX_NODE_REPL_IDLE_BROWSER_CLEANUP_MS` (default 600000,
+set `0` to disable).
 
 If `/tmp/codex-native-host-bridge.log` contains repeated `stdout backpressure`
 lines, the native host is sending commands to Chromium faster than Chromium is

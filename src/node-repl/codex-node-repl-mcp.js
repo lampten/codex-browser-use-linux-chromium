@@ -29,10 +29,19 @@ const TMP_DIR = realProcess.env.CODEX_NODE_REPL_TMPDIR || path.join(os.tmpdir(),
 const ARTIFACT_DIR = realProcess.env.CODEX_NODE_REPL_ARTIFACT_DIR || DEFAULT_CWD;
 const NODE_REPL_CHROMIUM_AUTOSTART_MARKER =
   "codex-browser-use-linux-chromium: node-repl-chromium-extension-autostart";
+const NODE_REPL_CHROMIUM_FOREGROUND_SOCKET_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-foreground-socket-selection";
 const NODE_REPL_CHROMIUM_NAVIGATION_PREFLIGHT_MARKER =
   "codex-browser-use-linux-chromium: node-repl-chromium-http-navigation-preflight";
+const NODE_REPL_IDLE_BROWSER_CLEANUP_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-idle-browser-cleanup";
+const NODE_REPL_CHROMIUM_PASSWORD_STORE_MARKER =
+  "codex-browser-use-linux-chromium: node-repl-chromium-password-store-basic";
 const BROWSER_USE_SOCKET_DIR =
   realProcess.env.CODEX_BROWSER_USE_SOCKET_DIR || path.join(os.tmpdir(), "codex-browser-use");
+const CHROMIUM_SOCKET_SELECTION = (
+  realProcess.env.CODEX_BROWSER_USE_CHROMIUM_SOCKET_SELECTION || "prefer-default-profile"
+).toLowerCase();
 const CHROMIUM_USER_DATA_DIR =
   realProcess.env.CODEX_BROWSER_USE_CHROMIUM_USER_DATA_DIR ||
   path.join(os.homedir(), ".config", "chromium");
@@ -79,6 +88,14 @@ const BROWSER_CLEANUP_TIMEOUT_MS = parseNonNegativeInt(
   realProcess.env.CODEX_NODE_REPL_BROWSER_CLEANUP_TIMEOUT_MS,
   3000
 );
+const IDLE_BROWSER_CLEANUP_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_NODE_REPL_IDLE_BROWSER_CLEANUP_MS,
+  10 * 60 * 1000
+);
+const SIGNAL_CLEANUP_EXIT_TIMEOUT_MS = parseNonNegativeInt(
+  realProcess.env.CODEX_NODE_REPL_SIGNAL_CLEANUP_EXIT_TIMEOUT_MS,
+  5000
+);
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 
@@ -91,6 +108,7 @@ let shutdownStarted = false;
 let timeoutExitRequested = false;
 let consecutiveJsTimeouts = 0;
 let lastContextResetReason = null;
+let idleBrowserCleanupTimer = null;
 
 function log(message, extra) {
   try {
@@ -213,6 +231,29 @@ function processState(pid) {
   }
 }
 
+function processParentPid(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const afterCommand = stat.slice(stat.lastIndexOf(")") + 2);
+    const fields = afterCommand.split(/\s+/);
+    const ppid = Number(fields[1]);
+    return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
+function processCommandArgs(pid) {
+  try {
+    return fs
+      .readFileSync(`/proc/${pid}/cmdline`, "utf8")
+      .split("\0")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 function processExists(pid) {
   try {
     realProcess.kill(pid, 0);
@@ -225,6 +266,21 @@ function processExists(pid) {
 function processIsLiveNonZombie(pid) {
   if (!Number.isInteger(pid) || pid <= 0 || !processExists(pid)) return false;
   return processState(pid) !== "Z";
+}
+
+function chromiumDefaultProfilePid() {
+  const lockPath = path.join(CHROMIUM_USER_DATA_DIR, "SingletonLock");
+  if (!fs.existsSync(lockPath)) return null;
+
+  let target;
+  try {
+    target = fs.readlinkSync(lockPath);
+  } catch {
+    return null;
+  }
+
+  const pid = chromiumSingletonPidFromTarget(target);
+  return processIsLiveNonZombie(pid) ? pid : null;
 }
 
 function chromiumSingletonPidFromTarget(target) {
@@ -260,22 +316,153 @@ function resolveChromiumProfileDirectory() {
 }
 
 function liveBrowserUseSockets() {
+  return rankedBrowserUseSockets();
+}
+
+function socketPidFromPath(socketPath) {
+  const match = path.basename(String(socketPath || "")).match(/^chromium-(\d+)\.sock$/);
+  if (!match) return null;
+  const pid = Number(match[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function socketSelectionEnabled() {
+  return !/^(0|false|no|off|all|disabled)$/.test(CHROMIUM_SOCKET_SELECTION);
+}
+
+function socketPathInBrowserUseDir(socketPath) {
+  const resolved = path.resolve(socketPath);
+  const resolvedDir = path.resolve(BROWSER_USE_SOCKET_DIR);
+  return resolved === resolvedDir || resolved.startsWith(`${resolvedDir}${path.sep}`);
+}
+
+function userDataDirFromCommandArgs(args) {
+  const match = commandLineText(args).match(/(?:^|\s)--user-data-dir=(?:"([^"]+)"|'([^']+)'|(\S+))/);
+  return match ? match[1] || match[2] || match[3] || null : null;
+}
+
+function commandLineText(args) {
+  return args.join(" ");
+}
+
+function commandLineHasFlag(args, flag) {
+  const text = ` ${commandLineText(args)} `;
+  return text.includes(` ${flag} `) || text.includes(` ${flag}=`);
+}
+
+function isTemporaryUserDataDir(userDataDir) {
+  if (!userDataDir) return false;
+  const resolved = path.resolve(userDataDir);
+  const tmp = path.resolve(os.tmpdir());
+  return resolved === tmp || resolved.startsWith(`${tmp}${path.sep}`);
+}
+
+function browserUseSocketCandidate(socketPath, defaultProfilePid = chromiumDefaultProfilePid()) {
+  const pid = socketPidFromPath(socketPath);
+  let isSocket = false;
+  try {
+    isSocket = fs.statSync(socketPath).isSocket();
+  } catch {
+    // Ignore races while Chromium or the native host starts/exits.
+  }
+
+  const ownerProcessAlive = processIsLiveNonZombie(pid);
+  const browserPid = ownerProcessAlive ? processParentPid(pid) : null;
+  const browserProcessAlive = processIsLiveNonZombie(browserPid);
+  const browserArgs = browserProcessAlive ? processCommandArgs(browserPid) : [];
+  const userDataDir = userDataDirFromCommandArgs(browserArgs);
+  const browserCommandLine = commandLineText(browserArgs);
+  const headless =
+    commandLineHasFlag(browserArgs, "--headless") ||
+    browserCommandLine.includes("--ozone-platform=headless");
+  const incognito = commandLineHasFlag(browserArgs, "--incognito");
+  const temporaryProfile = isTemporaryUserDataDir(userDataDir);
+  const defaultProfile =
+    browserPid != null &&
+    (browserPid === defaultProfilePid ||
+      (userDataDir != null && path.resolve(userDataDir) === path.resolve(CHROMIUM_USER_DATA_DIR)) ||
+      (userDataDir == null && !headless));
+
+  let score = 0;
+  const reasons = [];
+  if (ownerProcessAlive) score += 100;
+  if (browserProcessAlive) score += 100;
+  if (defaultProfilePid != null && browserPid === defaultProfilePid) {
+    score += 1000;
+    reasons.push("default-profile-singleton");
+  } else if (defaultProfile) {
+    score += 600;
+    reasons.push("default-profile");
+  }
+  if (browserCommandLine.includes("--load-extension=")) {
+    score += 50;
+    reasons.push("codex-extension-loaded");
+  }
+  if (headless) {
+    score -= 800;
+    reasons.push("headless");
+  }
+  if (temporaryProfile) {
+    score -= 700;
+    reasons.push("temporary-profile");
+  }
+  if (incognito) {
+    score -= 300;
+    reasons.push("incognito");
+  }
+
+  return {
+    path: socketPath,
+    pid,
+    isSocket,
+    ownerProcessAlive,
+    browserPid,
+    browserProcessAlive,
+    userDataDir,
+    defaultProfile,
+    headless,
+    temporaryProfile,
+    incognito,
+    score,
+    reasons,
+  };
+}
+
+function rankedBrowserUseSockets() {
   if (!fs.existsSync(BROWSER_USE_SOCKET_DIR)) return [];
+  const defaultProfilePid = chromiumDefaultProfilePid();
   return fs
     .readdirSync(BROWSER_USE_SOCKET_DIR)
     .filter((entry) => /^chromium-\d+\.sock$/.test(entry))
-    .map((entry) => {
-      const socketPath = path.join(BROWSER_USE_SOCKET_DIR, entry);
-      const pid = Number(entry.match(/^chromium-(\d+)\.sock$/)[1]);
-      let isSocket = false;
-      try {
-        isSocket = fs.statSync(socketPath).isSocket();
-      } catch {
-        // Ignore races while the extension starts or exits.
-      }
-      return { path: socketPath, pid, isSocket, ownerProcessAlive: processIsLiveNonZombie(pid) };
-    })
-    .filter((socket) => socket.isSocket && socket.ownerProcessAlive);
+    .map((entry) =>
+      browserUseSocketCandidate(path.join(BROWSER_USE_SOCKET_DIR, entry), defaultProfilePid)
+    )
+    .filter((socket) => socket.isSocket && socket.ownerProcessAlive)
+    .sort((left, right) => right.score - left.score || right.pid - left.pid);
+}
+
+function browserUseSocketConnectionDecision(socketPath) {
+  if (!socketSelectionEnabled() || !socketPathInBrowserUseDir(socketPath)) {
+    return { allow: true, reason: "selection-disabled-or-non-browser-use-socket" };
+  }
+
+  const resolved = path.resolve(socketPath);
+  const candidates = rankedBrowserUseSockets();
+  if (candidates.length <= 1) return { allow: true, reason: "single-candidate" };
+
+  const current = candidates.find((candidate) => path.resolve(candidate.path) === resolved);
+  if (!current) return { allow: true, reason: "unknown-candidate" };
+
+  const preferred = candidates[0];
+  if (preferred.score > current.score) {
+    return {
+      allow: false,
+      reason: "lower-priority-chromium-backend",
+      current,
+      preferred,
+    };
+  }
+  return { allow: true, reason: "preferred-candidate", current, preferred };
 }
 
 function cleanupStaleChromiumProfileLocks() {
@@ -319,7 +506,12 @@ function launchChromiumForExtension() {
   if (!command) throw new Error("Could not find chromium or chromium-browser on PATH");
 
   const profileDirectory = resolveChromiumProfileDirectory();
-  const args = [`--profile-directory=${profileDirectory}`, "--new-window", "about:blank"];
+  const args = [
+    `--profile-directory=${profileDirectory}`,
+    "--password-store=basic",
+    "--new-window",
+    "about:blank",
+  ];
   const child = childProcess.spawn(command, args, {
     detached: true,
     stdio: "ignore",
@@ -555,6 +747,12 @@ function makeNativePipe(nativeConnections) {
       if (typeof socketPath !== "string" || socketPath.length === 0) {
         throw new Error("createConnection requires a Unix socket path");
       }
+      const decision = browserUseSocketConnectionDecision(socketPath);
+      if (!decision.allow) {
+        const message = `Skipping lower-priority Chromium extension backend ${socketPath}; preferred ${decision.preferred.path} (${decision.preferred.reasons.join(",") || "score"}). Set CODEX_BROWSER_USE_CHROMIUM_SOCKET_SELECTION=all to disable this filter.`;
+        log("browser-use socket skipped", message);
+        throw new Error(message);
+      }
       const socket = net.createConnection(socketPath);
       nativeConnections.add(socket);
       socket.once("close", () => nativeConnections.delete(socket));
@@ -699,7 +897,36 @@ async function cleanupBrowserTabsWithTimeout(targetContext = context, reason = "
   }
 }
 
+function clearIdleBrowserCleanupTimer() {
+  if (!idleBrowserCleanupTimer) return;
+  clearTimeout(idleBrowserCleanupTimer);
+  idleBrowserCleanupTimer = null;
+}
+
+function scheduleIdleBrowserCleanup(reason = "idle") {
+  clearIdleBrowserCleanupTimer();
+  if (!IDLE_BROWSER_CLEANUP_MS || !context || context.__browserTabsFinalized) return;
+
+  idleBrowserCleanupTimer = setTimeout(() => {
+    idleBrowserCleanupTimer = null;
+    void runIdleBrowserCleanup(reason);
+  }, IDLE_BROWSER_CLEANUP_MS);
+  idleBrowserCleanupTimer.unref?.();
+}
+
+async function runIdleBrowserCleanup(reason = "idle") {
+  if (!context || context.__browserTabsFinalized || shutdownStarted) return;
+
+  const cleanupResult = await cleanupBrowserTabsWithTimeout(context, reason);
+  if (cleanupResult.status === "ok") {
+    disposeContextResources(context, reason);
+    context = null;
+    lastContextResetReason = reason;
+  }
+}
+
 function resetContext() {
+  clearIdleBrowserCleanupTimer();
   disposeContextResources(context, "reset");
   fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
   lastEmittedImages = [];
@@ -948,14 +1175,15 @@ function exitCodeForEnd() {
   return timeoutExitRequested ? 124 : 0;
 }
 
-async function shutdown() {
+async function shutdown(reason = "stdin-end", exitCode = exitCodeForEnd()) {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  clearIdleBrowserCleanupTimer();
   if (CLEANUP_TABS_ON_EXIT) {
-    await cleanupBrowserTabsWithTimeout(context, "stdin-end");
+    await cleanupBrowserTabsWithTimeout(context, reason);
   }
-  disposeContextResources(context, "stdin-end");
-  realProcess.exit(exitCodeForEnd());
+  disposeContextResources(context, reason);
+  realProcess.exit(exitCode);
 }
 
 const tools = [
@@ -1026,6 +1254,7 @@ function toolErrorResult(error) {
 function errorMessage(error) {
   const message = error && error.message ? error.message : String(error);
   if (isMissingBrowserTabError(error)) return browserTabMissingMessage(message);
+  if (isBrowserApiShapeError(error)) return browserApiShapeMessage(message);
   if (!isBrowserBridgeStaleError(error)) return message;
   if (/js_reset|re-bootstrap/i.test(message)) return message;
   return `${message}. Browser bridge state was reset; run js_reset, re-bootstrap the runtime, create a new tab, and navigate to the target URL again before retrying. Do not reuse an existing tab with the same URL after this error.`;
@@ -1043,6 +1272,17 @@ function browserTabMissingMessage(message) {
   return `${message}.${resetContext} Re-run the full Browser bootstrap, assign globalThis.browser, create a fresh globalThis.tab, and navigate to the target URL before using tab.* again. Do not use tab.url() or tab.title() as a lightweight check until a new tab binding exists.`;
 }
 
+function isBrowserApiShapeError(error) {
+  const message = error && error.message ? error.message : String(error);
+  return /agent\.browsers\.(map|filter|forEach|find) is not a function|agent\.browsers is not iterable/i.test(
+    message
+  );
+}
+
+function browserApiShapeMessage(message) {
+  return `${message}. \`agent.browsers\` is a Browser registry object, not an array. Use \`const browsers = await agent.browsers.list();\` before array operations such as map/filter/find, or use \`await agent.browsers.get("extension")\` to select Chromium directly.`;
+}
+
 function isBrowserBridgeStaleError(error) {
   const message = error && error.message ? error.message : String(error);
   return /native pipe is closed|native pipe closed before response|Detached while handling command|Timed out after \d+ms waiting for CDP command/i.test(
@@ -1058,6 +1298,7 @@ function formatBrowserCleanupResult(result) {
 
 async function callTool(name, args = {}) {
   if (name === "js") {
+    clearIdleBrowserCleanupTimer();
     const timeoutMs = jsTimeoutFromArgs(args);
     const startedAt = Date.now();
     log("js call started", `timeout_ms=${timeoutMs} ${summarizeJsArgs(args)}`);
@@ -1090,13 +1331,16 @@ async function callTool(name, args = {}) {
         lastContextResetReason = "browser bridge error";
         return toolErrorResult(error);
       }
+      if (isBrowserApiShapeError(error)) return toolErrorResult(error);
       if (isMissingBrowserTabError(error)) return toolErrorResult(error);
       throw error;
     } finally {
       log("js call finished", `duration_ms=${Date.now() - startedAt} ${summarizeJsArgs(args)}`);
+      scheduleIdleBrowserCleanup("idle");
     }
   }
   if (name === "js_reset") {
+    clearIdleBrowserCleanupTimer();
     consecutiveJsTimeouts = 0;
     lastContextResetReason = "js_reset";
     const cleanupResult = CLEANUP_TABS_ON_RESET
@@ -1108,6 +1352,7 @@ async function callTool(name, args = {}) {
     };
   }
   if (name === "browser_cleanup") {
+    clearIdleBrowserCleanupTimer();
     const cleanupResult = await cleanupBrowserTabsWithTimeout(context, "browser_cleanup");
     return { content: [{ type: "text", text: formatBrowserCleanupResult(cleanupResult) }] };
   }
@@ -1150,34 +1395,134 @@ async function handleMessage(message) {
   }
 }
 
-let input = "";
-STDIN.setEncoding("utf8");
-STDIN.on("data", (chunk) => {
-  input += chunk;
+let input = Buffer.alloc(0);
+const CONTENT_LENGTH_HEADER = Buffer.from("content-length:", "ascii");
+
+function enqueueMessage(message) {
+  queue = queue
+    .then(() => handleMessage(message))
+    .catch((error) => log("queued request failed", error.stack || error.message))
+    .finally(() => {
+      if (endRequested) queueMicrotask(() => shutdown());
+    });
+}
+
+function trimLeadingTransportWhitespace(buffer) {
+  let offset = 0;
+  while (
+    offset < buffer.length &&
+    (buffer[offset] === 0x20 || buffer[offset] === 0x09 || buffer[offset] === 0x0d || buffer[offset] === 0x0a)
+  ) {
+    offset += 1;
+  }
+  return offset === 0 ? buffer : buffer.slice(offset);
+}
+
+function startsWithContentLength(buffer) {
+  if (buffer.length < CONTENT_LENGTH_HEADER.length) return false;
+  return (
+    buffer
+      .slice(0, CONTENT_LENGTH_HEADER.length)
+      .toString("ascii")
+      .toLowerCase() === CONTENT_LENGTH_HEADER.toString("ascii")
+  );
+}
+
+function headerEnd(buffer) {
+  const crlf = buffer.indexOf(Buffer.from("\r\n\r\n", "ascii"));
+  if (crlf !== -1) return { index: crlf, length: 4 };
+  const lf = buffer.indexOf(Buffer.from("\n\n", "ascii"));
+  if (lf !== -1) return { index: lf, length: 2 };
+  return null;
+}
+
+function parseContentLengthMessage(buffer) {
+  const end = headerEnd(buffer);
+  if (!end) return null;
+
+  const header = buffer.slice(0, end.index).toString("ascii");
+  const match = header.match(/(?:^|\r?\n)content-length:\s*(\d+)\s*(?:\r?\n|$)/i);
+  if (!match) throw new Error(`Missing Content-Length header: ${header}`);
+
+  const length = Number(match[1]);
+  if (!Number.isSafeInteger(length) || length < 0) {
+    throw new Error(`Invalid Content-Length: ${match[1]}`);
+  }
+
+  const bodyStart = end.index + end.length;
+  const bodyEnd = bodyStart + length;
+  if (buffer.length < bodyEnd) return null;
+
+  return {
+    message: JSON.parse(buffer.slice(bodyStart, bodyEnd).toString("utf8")),
+    rest: buffer.slice(bodyEnd),
+  };
+}
+
+function parseNewlineMessage(buffer) {
+  const newline = buffer.indexOf(0x0a);
+  if (newline === -1) return null;
+
+  const line = buffer.slice(0, newline).toString("utf8").trim();
+  return {
+    message: line ? JSON.parse(line) : null,
+    rest: buffer.slice(newline + 1),
+  };
+}
+
+function drainInputBuffer() {
   for (;;) {
-    const newline = input.indexOf("\n");
-    if (newline === -1) break;
-    const line = input.slice(0, newline).trim();
-    input = input.slice(newline + 1);
-    if (!line) continue;
+    input = trimLeadingTransportWhitespace(input);
+    if (input.length === 0) return;
+
     try {
-      const message = JSON.parse(line);
-      queue = queue
-        .then(() => handleMessage(message))
-        .catch((error) => log("queued request failed", error.stack || error.message))
-        .finally(() => {
-          if (endRequested) queueMicrotask(() => shutdown());
-        });
+      const parsed = startsWithContentLength(input)
+        ? parseContentLengthMessage(input)
+        : parseNewlineMessage(input);
+      if (!parsed) return;
+      input = parsed.rest;
+      if (parsed.message) enqueueMessage(parsed.message);
     } catch (error) {
       log("parse failed", error.stack || error.message);
+      input = Buffer.alloc(0);
+      return;
     }
   }
+}
+
+STDIN.on("data", (chunk) => {
+  input = Buffer.concat([input, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+  drainInputBuffer();
 });
 
 STDIN.on("end", () => {
   endRequested = true;
-  queue.finally(() => shutdown());
+  queue.finally(() => shutdown("stdin-end"));
 });
+
+function signalExitCode(signal) {
+  const numbers = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 };
+  return 128 + (numbers[signal] || 0);
+}
+
+function requestSignalShutdown(signal) {
+  if (shutdownStarted) return;
+  endRequested = true;
+  const forcedExit = setTimeout(() => {
+    log("signal cleanup timed out", `signal=${signal}`);
+    realProcess.exit(signalExitCode(signal));
+  }, SIGNAL_CLEANUP_EXIT_TIMEOUT_MS);
+  forcedExit.unref?.();
+  queue.finally(async () => {
+    clearTimeout(forcedExit);
+    await shutdown(`signal:${signal}`, signalExitCode(signal));
+  });
+}
+
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  realProcess.on(signal, () => requestSignalShutdown(signal));
+}
+
 realProcess.on("uncaughtException", (error) => {
   log("uncaught exception", error.stack || error.message);
   realProcess.exit(1);
@@ -1186,5 +1531,5 @@ realProcess.on("uncaughtException", (error) => {
 resetContext();
 log(
   "started",
-  `pid=${realProcess.pid} session_id=${SESSION_ID} turn_id=${TURN_ID} js_timeout_ms=${JS_TIMEOUT_MS} browser_cleanup_timeout_ms=${BROWSER_CLEANUP_TIMEOUT_MS}`
+  `pid=${realProcess.pid} session_id=${SESSION_ID} turn_id=${TURN_ID} js_timeout_ms=${JS_TIMEOUT_MS} browser_cleanup_timeout_ms=${BROWSER_CLEANUP_TIMEOUT_MS} idle_browser_cleanup_ms=${IDLE_BROWSER_CLEANUP_MS}`
 );
