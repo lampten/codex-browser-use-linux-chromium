@@ -1658,16 +1658,109 @@ function patchChromeIsRunning(text) {
 }
 
 function patchLinuxUserDataDirectory(text) {
-  if (text.includes('".config", "chromium"')) return text;
-  return replaceRequired(
-    text,
-    'return path.join(os.homedir(), ".config", "google-chrome");',
-    `const chromiumDirectory = path.join(os.homedir(), ".config", "chromium");
+  let output = text;
+  if (!output.includes('".config", "chromium"')) {
+    output = replaceRequired(
+      output,
+      'return path.join(os.homedir(), ".config", "google-chrome");',
+      `const chromiumDirectory = path.join(os.homedir(), ".config", "chromium");
   if (fs.existsSync(chromiumDirectory)) return chromiumDirectory;
 
   return path.join(os.homedir(), ".config", "google-chrome");`,
-    "Linux Chromium user data directory"
+      "Linux Chromium user data directory"
+    );
+  }
+
+  return output;
+}
+
+function patchCheckExtensionInstalled(text) {
+  let output = patchLinuxUserDataDirectory(text);
+  const marker = "codex-browser-use-linux-chromium: linux-system-extension-status";
+  if (output.includes(marker)) return output;
+
+  output = replaceRegexRequired(
+    output,
+    /function getChromeExtensionInstallStatus\(\) \{\r?\n  const extensionId = loadRemoteChromeExtensionId\(\);/,
+    `/* ${marker} */
+function getLinuxSystemExtensionStatus(extensionId) {
+  if (process.platform !== "linux") {
+    return {
+      installed: false,
+      path: null,
+      manifestPath: null,
+      version: null,
+      versionName: null,
+    };
+  }
+
+  const candidates = [
+    path.join("/usr/share/chromium/extensions", "codex"),
+    path.join("/usr/share/chromium/extensions", extensionId),
+    path.join("/usr/share/google-chrome/extensions", "codex"),
+    path.join("/usr/share/google-chrome/extensions", extensionId),
+  ];
+
+  for (const extensionPath of candidates) {
+    const manifestPath = path.join(extensionPath, "manifest.json");
+    const manifest = readJsonFileIfPresent(manifestPath);
+    if (!manifest || typeof manifest !== "object") continue;
+
+    const permissions = Array.isArray(manifest.permissions)
+      ? manifest.permissions
+      : [];
+    const versionName =
+      typeof manifest.version_name === "string" ? manifest.version_name : null;
+    const looksLikeCodex =
+      manifest.name === "Codex" ||
+      (versionName || "").includes("codex-browser-use-linux-chromium");
+    if (!looksLikeCodex || !permissions.includes("nativeMessaging")) continue;
+
+    return {
+      installed: true,
+      path: extensionPath,
+      manifestPath,
+      version: typeof manifest.version === "string" ? manifest.version : null,
+      versionName,
+    };
+  }
+
+  return {
+    installed: false,
+    path: null,
+    manifestPath: null,
+    version: null,
+    versionName: null,
+  };
+}
+
+function getChromeExtensionInstallStatus() {
+  const extensionId = loadRemoteChromeExtensionId();
+  const linuxSystemExtension = getLinuxSystemExtensionStatus(extensionId);`,
+    "Linux system extension install status"
   );
+  output = replaceRegexRequired(
+    output,
+    /  const installed = versions\.length > 0;/,
+    "  const profileInstalled = versions.length > 0;\n  const installed = profileInstalled || linuxSystemExtension.installed;",
+    "Linux system extension installed flag"
+  );
+  output = replaceRegexRequired(
+    output,
+    /    installed,\r?\n    registered: preferences\.registered,/,
+    "    installed,\n    profileInstalled,\n    linuxSystemExtension,\n    registered: preferences.registered,",
+    "Linux system extension status fields"
+  );
+  output = replaceRegexRequired(
+    output,
+    /    console\.log\(`Installed: \$\{result\.installed \? "yes" : "no"\}`\);/,
+    `    console.log(\`Installed: \${result.installed ? "yes" : "no"}\`);
+    if (result.linuxSystemExtension?.installed) {
+      console.log(\`Linux system extension: \${result.linuxSystemExtension.path}\`);
+    }`,
+    "Linux system extension human output"
+  );
+  return output;
 }
 
 function patchCheckNativeHostManifest(text) {
@@ -1760,6 +1853,8 @@ const BROWSER_SKILL_UNIFIED_BOOTSTRAP_PATCH_MARKER =
   "codex-browser-use-linux-chromium: browser-skill-unified-bootstrap";
 const CHROME_SKILL_NODE_REPL_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-node-repl-discovery";
+const CHROME_SKILL_FIRST_BOOTSTRAP_PATCH_MARKER =
+  "codex-browser-use-linux-chromium: chrome-first-bootstrap-required";
 const CHROME_SKILL_TIMEOUT_PATCH_MARKER =
   "codex-browser-use-linux-chromium: chrome-timeout-recovery";
 const CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER =
@@ -1978,10 +2073,13 @@ if (!globalThis.browser) {
 function patchChromeSkill(text) {
   if (
     text.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER) &&
+    text.includes(CHROME_SKILL_FIRST_BOOTSTRAP_PATCH_MARKER) &&
     text.includes(CHROME_SKILL_TIMEOUT_PATCH_MARKER) &&
     text.includes(CHROME_SKILL_COMMAND_SCOPING_PATCH_MARKER) &&
     text.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
     text.includes("final answer must include the Markdown image link") &&
+    text.includes("Do not call `browser.user.openTabs()` before this setup cell") &&
+    text.includes("`ReferenceError: browser is not defined` means this bootstrap was skipped") &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
     text.includes("browser_cleanup") &&
@@ -2028,10 +2126,32 @@ function patchChromeSkill(text) {
 ## Linux Chromium Node REPL Compatibility
 
 <!-- ${CHROME_SKILL_NODE_REPL_PATCH_MARKER} -->
+<!-- ${CHROME_SKILL_FIRST_BOOTSTRAP_PATCH_MARKER} -->
 
 On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, Chrome plugin tasks must use the Chrome plugin's \`node_repl\` MCP server. Search for \`node_repl js\` and call \`mcp__node_repl__js\`.
 
 Do not use \`browser_node_repl\` for Chrome plugin tasks. \`browser_node_repl\` is reserved for Browser / in-app browser compatibility and can cause Chrome tasks to follow Browser-specific routing instructions.
+
+Before any Chrome browser call in a fresh \`node_repl\` session, run this setup cell. Do not call \`browser.user.openTabs()\` before this setup cell, and do not call \`browser.tabs.list()\`, \`browser.tabs.new()\`, \`agent.browsers.get(...)\`, or extension self-check scripts as a substitute for this setup cell. \`ReferenceError: browser is not defined\` means this bootstrap was skipped; run this setup cell and retry the browser call instead of reporting a Chrome extension failure.
+
+\`\`\`js
+const pluginRoot = "<plugin root>";
+const { setupAtlasRuntime } = await import(\`\${pluginRoot}/scripts/browser-client.mjs\`);
+await setupAtlasRuntime({ globals: globalThis });
+globalThis.browser = await globalThis.agent.browsers.get("extension");
+const tabs = await browser.user.openTabs();
+nodeRepl.write(JSON.stringify({
+  ok: true,
+  tabCount: tabs.length,
+  sample: tabs.slice(0, 5).map((tab) => ({
+    title: tab.title,
+    url: tab.url,
+    tabGroup: tab.tabGroup,
+  })),
+}, null, 2));
+\`\`\`
+
+On this Linux-patched Chromium setup, \`scripts/check-extension-installed.js\` may report a system-registered extension rather than profile-local files under \`Default/Extensions\`. A profile-local \`installed:false\` result is not by itself proof that the Chrome backend is unavailable; prefer the setup cell plus \`browser.user.openTabs()\` as the first live proof.
 
 Before ending a Chrome task, call \`browser_cleanup\` from \`node_repl\` when it is visible. It runs the current session's tab finalizer with an empty keep list, equivalent to \`await browser.tabs.finalize({ keep: [] })\`, and avoids leaving Chromium full of task tabs. If \`browser_cleanup\` is not visible, run that finalizer in a final single-purpose \`js\` call.
 
@@ -2174,7 +2294,7 @@ const CHROME_PLUGIN_PATCHES = [
   ["scripts/browser-client.mjs", patchBrowserClient],
   ["scripts/installed-browsers.js", patchInstalledBrowsers],
   ["scripts/chrome-is-running.js", patchChromeIsRunning],
-  ["scripts/check-extension-installed.js", patchLinuxUserDataDirectory],
+  ["scripts/check-extension-installed.js", patchCheckExtensionInstalled],
   ["scripts/check-native-host-manifest.js", patchCheckNativeHostManifest],
   ["scripts/open-chrome-window.js", patchOpenChromeWindow],
   ["skills/chrome/SKILL.md", patchChromeSkill],
@@ -2698,6 +2818,10 @@ function patchStatusForRoot(root, paths) {
       ),
     extensionCheckChromiumProfile:
       /path\.join\(os\.homedir\(\),\s*"\.config",\s*"chromium"\)/.test(extensionInstalled),
+    extensionCheckLinuxSystemExtension:
+      extensionInstalled.includes("codex-browser-use-linux-chromium: linux-system-extension-status") &&
+      extensionInstalled.includes("getLinuxSystemExtensionStatus") &&
+      extensionInstalled.includes('"/usr/share/chromium/extensions"'),
     nativeHostManifestLinux:
       /process\.platform\s*===\s*"linux"[\s\S]*resolveLinuxNativeHostManifestPath/.test(
         nativeHostManifest
@@ -2707,6 +2831,10 @@ function patchStatusForRoot(root, paths) {
     openWindowPasswordStore:
       /args:\s*\[\s*"--password-store=basic",\s*...chromeArgs\s*\]/.test(openWindow),
     chromeSkillNodeReplDiscovery: chromeSkill.includes(CHROME_SKILL_NODE_REPL_PATCH_MARKER),
+    chromeSkillFirstBootstrapRequired:
+      chromeSkill.includes(CHROME_SKILL_FIRST_BOOTSTRAP_PATCH_MARKER) &&
+      chromeSkill.includes("Do not call `browser.user.openTabs()` before this setup cell") &&
+      chromeSkill.includes("`ReferenceError: browser is not defined` means this bootstrap was skipped"),
     chromeSkillScreenshotOutput:
       chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
       chromeSkill.includes("final answer must include the Markdown image link"),
