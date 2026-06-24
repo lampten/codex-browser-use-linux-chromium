@@ -114,12 +114,13 @@ tasks still start from the `@browser` entrypoint but select the Chromium-backed
 
 Fresh Codex conversations may run this bootstrap before any normal Chromium
 window has loaded the extension. The patched `node_repl` runtime therefore
-exposes `nodeRepl.ensureChromiumExtensionReady()`. The Browser skill calls it
-only after `agent.browsers.get("extension")` reports that no extension backend
-is available. The helper conservatively removes stale default-profile singleton
+exposes `nodeRepl.ensureChromiumExtensionReady()`. The Browser and Chrome skill
+bootstrap cells use it before extension backend discovery, and force one retry
+when `agent.browsers.get("extension")` reports that no extension backend is
+available. The helper conservatively removes stale default-profile singleton
 files when they point at a dead or zombie Chromium process, launches Chromium
 with the selected profile, waits for a live `/tmp/codex-browser-use` socket, and
-then lets the Browser skill retry extension discovery.
+then lets the skill retry extension discovery.
 
 Earlier versions tried to make `iab` an alias for the extension backend. That
 was close enough for lightweight DOM reads, but it was not equivalent for

@@ -2080,6 +2080,11 @@ function patchChromeSkill(text) {
     text.includes("final answer must include the Markdown image link") &&
     text.includes("Do not call `browser.user.openTabs()` before this setup cell") &&
     text.includes("`ReferenceError: browser is not defined` means this bootstrap was skipped") &&
+    text.includes("ensureChromiumExtensionReady") &&
+    text.includes("setupCodexChromeRuntime") &&
+    text.includes("ensureCodexChromeRuntimeReady") &&
+    text.includes("delete globalThis.agent") &&
+    text.includes("force: true") &&
     text.includes("do not silently replace a requested screenshot with text-only output") &&
     text.includes("create a new tab and navigate to the target URL again") &&
     text.includes("browser_cleanup") &&
@@ -2132,13 +2137,42 @@ On Linux remote hosts patched by \`codex-browser-use-linux-chromium\`, Chrome pl
 
 Do not use \`browser_node_repl\` for Chrome plugin tasks. \`browser_node_repl\` is reserved for Browser / in-app browser compatibility and can cause Chrome tasks to follow Browser-specific routing instructions.
 
-Before any Chrome browser call in a fresh \`node_repl\` session, run this setup cell. Do not call \`browser.user.openTabs()\` before this setup cell, and do not call \`browser.tabs.list()\`, \`browser.tabs.new()\`, \`agent.browsers.get(...)\`, or extension self-check scripts as a substitute for this setup cell. \`ReferenceError: browser is not defined\` means this bootstrap was skipped; run this setup cell and retry the browser call instead of reporting a Chrome extension failure.
+Before any Chrome browser call in a fresh \`node_repl\` session, run this guarded setup cell. It asks the local runtime to open the patched Chromium profile before backend discovery, then retries if \`agent.browsers.get("extension")\` still reports that the extension backend is unavailable. Do not call \`browser.user.openTabs()\` before this setup cell, and do not call \`browser.tabs.list()\`, \`browser.tabs.new()\`, \`agent.browsers.get(...)\`, or extension self-check scripts as a substitute for this setup cell. \`ReferenceError: browser is not defined\` means this bootstrap was skipped; run this setup cell and retry the browser call instead of reporting a Chrome extension failure.
 
 \`\`\`js
 const pluginRoot = "<plugin root>";
-const { setupAtlasRuntime } = await import(\`\${pluginRoot}/scripts/browser-client.mjs\`);
-await setupAtlasRuntime({ globals: globalThis });
-globalThis.browser = await globalThis.agent.browsers.get("extension");
+async function setupCodexChromeRuntime() {
+  const { setupAtlasRuntime } = await import(\`\${pluginRoot}/scripts/browser-client.mjs\`);
+  await setupAtlasRuntime({ globals: globalThis });
+}
+async function ensureCodexChromeRuntimeReady() {
+  if (globalThis.nodeRepl?.ensureChromiumExtensionReady) {
+    await globalThis.nodeRepl.ensureChromiumExtensionReady({ timeoutMs: 10000 });
+  }
+  delete globalThis.agent;
+  await setupCodexChromeRuntime();
+}
+if (!globalThis.agent) {
+  await ensureCodexChromeRuntimeReady();
+}
+if (!globalThis.browser) {
+  try {
+    globalThis.browser = await globalThis.agent.browsers.get("extension");
+  } catch (error) {
+    if (
+      globalThis.nodeRepl?.ensureChromiumExtensionReady &&
+      /Browser is not available: extension/.test(error?.message || String(error))
+    ) {
+      await globalThis.nodeRepl.ensureChromiumExtensionReady({ force: true, timeoutMs: 10000 });
+      delete globalThis.agent;
+      delete globalThis.browser;
+      await ensureCodexChromeRuntimeReady();
+      globalThis.browser = await globalThis.agent.browsers.get("extension");
+    } else {
+      throw error;
+    }
+  }
+}
 const tabs = await browser.user.openTabs();
 nodeRepl.write(JSON.stringify({
   ok: true,
@@ -2834,7 +2868,12 @@ function patchStatusForRoot(root, paths) {
     chromeSkillFirstBootstrapRequired:
       chromeSkill.includes(CHROME_SKILL_FIRST_BOOTSTRAP_PATCH_MARKER) &&
       chromeSkill.includes("Do not call `browser.user.openTabs()` before this setup cell") &&
-      chromeSkill.includes("`ReferenceError: browser is not defined` means this bootstrap was skipped"),
+      chromeSkill.includes("`ReferenceError: browser is not defined` means this bootstrap was skipped") &&
+      chromeSkill.includes("ensureChromiumExtensionReady") &&
+      chromeSkill.includes("setupCodexChromeRuntime") &&
+      chromeSkill.includes("ensureCodexChromeRuntimeReady") &&
+      chromeSkill.includes("delete globalThis.agent") &&
+      chromeSkill.includes("force: true"),
     chromeSkillScreenshotOutput:
       chromeSkill.includes(SCREENSHOT_OUTPUT_PATCH_MARKER) &&
       chromeSkill.includes("final answer must include the Markdown image link"),
